@@ -1,0 +1,167 @@
+diff --git a/build.zig b/build.zig
+index 85a91fb..f401fcd 100644
+--- a/build.zig
++++ b/build.zig
+@@ -223,6 +223,14 @@ pub fn build(b: *std.Build) !void {
+         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
+         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
+ 
++        // Plain static lib + header + resources for embedders that link
++        // libghostty directly instead of through the xcframework.
++        if (config.target.result.os.tag.isDarwin() and config.emit_macos_static_lib) {
++            lib_shared.installHeader();
++            lib_static.install("libghostty.a");
++            resources.install();
++        }
++
+         // We shouldn't have this guard but we don't currently
+         // build on macOS this way ironically so we need to fix that.
+         if (!config.target.result.os.tag.isDarwin()) {
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 697f0a7..d7ff17f 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -569,7 +569,8 @@ pub const Surface = struct {
+             const cmd = std.mem.sliceTo(c_command, 0);
+             if (cmd.len > 0) {
+                 config.command = .{ .shell = cmd };
+-                config.@"wait-after-command" = true;
++                // ghostdrop: don't force wait-after-command for custom
++                // commands; the embedder decides via `wait_after_command`.
+             }
+         }
+ 
+diff --git a/src/build/Config.zig b/src/build/Config.zig
+index 2415729..0059f4e 100644
+--- a/src/build/Config.zig
++++ b/src/build/Config.zig
+@@ -67,6 +67,13 @@ emit_xcframework: bool = false,
+ emit_webdata: bool = false,
+ emit_unicode_table_gen: bool = false,
+ 
++/// Embed the Metal shader *source* and compile it at runtime instead of
++/// precompiling a metallib with `xcrun metal` (which needs full Xcode).
++metal_runtime_compile: bool = false,
++
++/// Install the static libghostty + header on macOS without an xcframework.
++emit_macos_static_lib: bool = false,
++
+ /// Feature gates for libghostty-vt artifacts (-Dvt-features). The full
+ /// Ghostty application ignores this and always enables everything.
+ vt_features: TerminalBuildOptions.Features = .{},
+@@ -581,6 +588,18 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
+                 !config.emit_helpgen);
+     };
+ 
++    config.metal_runtime_compile = b.option(
++        bool,
++        "metal-runtime-compile",
++        "Compile Metal shaders at runtime (no Xcode Metal toolchain needed).",
++    ) orelse false;
++
++    config.emit_macos_static_lib = b.option(
++        bool,
++        "emit-macos-static-lib",
++        "Install libghostty.a, ghostty.h and resources on macOS (no xcframework).",
++    ) orelse false;
++
+     config.emit_macos_app = b.option(
+         bool,
+         "emit-macos-app",
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 8f4e239..17fd4fb 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -500,11 +500,18 @@ pub fn add(
+     if (step.rootModuleTarget().os.tag.isDarwin()) {
+         try @import("apple_sdk").addPaths(b, step);
+ 
+-        const metallib = self.metallib.?;
+-        metallib.output.addStepDependencies(&step.step);
+-        step.root_module.addAnonymousImport("ghostty_metallib", .{
+-            .root_source_file = metallib.output,
+-        });
++        if (self.config.metal_runtime_compile) {
++            // Embed the shader source; shaders.zig compiles it at runtime.
++            step.root_module.addAnonymousImport("ghostty_metallib", .{
++                .root_source_file = b.path("src/renderer/shaders/shaders.metal"),
++            });
++        } else {
++            const metallib = self.metallib.?;
++            metallib.output.addStepDependencies(&step.step);
++            step.root_module.addAnonymousImport("ghostty_metallib", .{
++                .root_source_file = metallib.output,
++            });
++        }
+     }
+ 
+     // Other dependencies, mostly pure Zig
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index b14068f..9f47061 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -333,11 +333,63 @@ pub const BgImage = extern struct {
+ };
+ 
+ /// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
++/// The embedded shader blob. This is either a precompiled metallib
++/// (magic "MTLB") or, when built with -Dmetal-runtime-compile, the
++/// Metal shader source which we compile once per process at runtime.
++const embedded_shaders = @embedFile("ghostty_metallib");
++const embedded_is_metallib = std.mem.startsWith(u8, embedded_shaders, "MTLB");
++
++/// Process-wide cache for the runtime-compiled library so that only the
++/// first surface pays the compile cost. Keyed by device.
++var runtime_lib_mutex: std.atomic.Mutex = .unlocked;
++var runtime_lib_device: usize = 0;
++var runtime_lib: ?objc.Object = null;
++
+ fn initLibrary(device: objc.Object) !objc.Object {
++    if (comptime !embedded_is_metallib) return try initLibraryFromSource(device);
++    return try initLibraryFromMetallib(device);
++}
++
++fn initLibraryFromSource(device: objc.Object) !objc.Object {
++    while (!runtime_lib_mutex.tryLock()) std.atomic.spinLoopHint();
++    defer runtime_lib_mutex.unlock();
++
++    if (runtime_lib) |lib| {
++        if (runtime_lib_device == @intFromPtr(device.value)) {
++            // Caller owns a reference (it releases on deinit).
++            return lib.msgSend(objc.Object, objc.sel("retain"), .{});
++        }
++    }
++
++    const start: std.Io.Timestamp = .now(global.io(), .awake);
++    const source = try macos.foundation.String.createWithBytes(
++        embedded_shaders,
++        .utf8,
++        false,
++    );
++    defer source.release();
++
++    var err: ?*anyopaque = null;
++    const library = device.msgSend(
++        objc.Object,
++        objc.sel("newLibraryWithSource:options:error:"),
++        .{ source, @as(?*anyopaque, null), &err },
++    );
++    try checkError(err);
++
++    log.debug("shader library compiled from source time={}us", .{start.untilNow(global.io(), .awake).toMicroseconds()});
++
++    if (runtime_lib) |old| old.msgSend(void, objc.sel("release"), .{});
++    runtime_lib = library.msgSend(objc.Object, objc.sel("retain"), .{});
++    runtime_lib_device = @intFromPtr(device.value);
++    return library;
++}
++
++fn initLibraryFromMetallib(device: objc.Object) !objc.Object {
+     const start: std.Io.Timestamp = .now(global.io(), .awake);
+ 
+     const data = try macos.dispatch.Data.create(
+-        @embedFile("ghostty_metallib"),
++        embedded_shaders,
+         macos.dispatch.queue.getMain(),
+         macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+     );

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Ghostdrop</string>
+	<key>CFBundleExecutable</key>
+	<string>ghostdrop</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.ghostdrop.Ghostdrop</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Ghostdrop</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>MDItemKeywords</key>
+	<string>Terminal</string>
+	<key>NSAppSleepDisabled</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>A program running within Ghostdrop would like to use AppleScript.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>A program running within Ghostdrop would like to use Bluetooth.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access your Calendar.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A program running within Ghostdrop would like to use the camera.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access your Contacts.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access the local network.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access your location information.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A program running within Ghostdrop would like to use your microphone.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access motion data.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access your Photo Library.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>A program running within Ghostdrop would like to access your reminders.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>A program running within Ghostdrop would like to use speech recognition.</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>A program running within Ghostdrop requires elevated privileges.</string>
+</dict>
+</plist>
