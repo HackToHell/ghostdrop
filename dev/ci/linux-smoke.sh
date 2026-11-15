@@ -14,7 +14,8 @@ trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$T"' EXIT
 
 GHOSTDROP_CONFIG="$T/config" "$G" check
 "$G" +version
-test -f /usr/share/doc/ghostdrop/AGENTS.md
+# Container images often skip usr/share/doc (pacman NoExtract): check the package.
+pacman -Qlq ghostdrop | grep -qx /usr/share/doc/ghostdrop/AGENTS.md
 test -f /usr/share/ghostdrop/terminfo/x/xterm-ghostty
 test -d /usr/share/ghostdrop/ghostty/shell-integration
 # libghostty resolves next to the binary (rpath $ORIGIN/../lib/ghostdrop).
