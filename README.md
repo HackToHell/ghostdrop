@@ -44,10 +44,10 @@ makepkg -si
 ```
 
 (`make pkg` in the repo root does the same.) The package builds from your clone
-(local changes included) with the pinned
-Zig 0.17.1 (checksummed) and the crates locked in `linux/Cargo.lock`, and installs
-`/usr/bin/ghostdrop` plus its own libghostty under `/usr/lib/ghostdrop`. To update,
-`git pull --recurse-submodules` and run `makepkg -si` again.
+(local changes included) with the pinned Zig 0.17.1 (checksummed) and the crates
+locked in `linux/Cargo.lock`, and installs `/usr/bin/ghostdrop` plus its own
+libghostty under `/usr/lib/ghostdrop`. To update, `git pull --recurse-submodules`
+and run `makepkg -si` again.
 
 **Other distributions:** install Rust, clang (for bindgen), pkg-config and the
 libxkbcommon, libxkbcommon-x11 and libxcb development packages, then
