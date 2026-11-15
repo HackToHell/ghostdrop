@@ -10,11 +10,29 @@ pub fn socket_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    // One instance per display, so two sessions (or a nested compositor)
+    // don't fight over one socket; `ghostdrop ctl` inside a session reaches
+    // that session's instance.
+    let display = display_tag();
     let uid = unsafe { libc::getuid() };
     match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d).join("ghostdrop.sock"),
-        _ => std::env::temp_dir().join(format!("ghostdrop-{uid}.sock")),
+        Some(d) if !d.is_empty() => PathBuf::from(d).join(format!("ghostdrop-{display}.sock")),
+        _ => std::env::temp_dir().join(format!("ghostdrop-{uid}-{display}.sock")),
     }
+}
+
+/// `wayland-1`, `x11-0`, … from the environment (`default` without a display).
+fn display_tag() -> String {
+    let clean = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>();
+    if let Some(w) = std::env::var("WAYLAND_DISPLAY").ok().filter(|w| !w.is_empty()) {
+        // May be an absolute path; keep the socket name only.
+        return clean(w.rsplit('/').next().unwrap_or(&w));
+    }
+    if let Some(d) = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()) {
+        // ":1", ":1.0", "host:1" → "x11-1", "x11-1.0", "x11-host_1"
+        return format!("x11-{}", clean(d.trim_start_matches(':')));
+    }
+    "default".into()
 }
 
 /// Send one command to the running instance. Returns its reply.
