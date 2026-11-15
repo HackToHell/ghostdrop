@@ -1,0 +1,32 @@
+[package]
+name = "ghostdrop"
+version = "0.1.0"
+edition = "2021"
+description = "Fast drop-down terminal for Linux (Wayland + X11) built on libghostty"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = { version = "0.9", features = ["wayland", "x11"] }
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "shm", "xkb", "randr", "dl-libxcb", "cursor", "resource_manager"] }
+fontdue = "0.9"
+memmap2 = "0.9"
+rustix = { version = "1", features = ["fs", "shm", "pipe", "event", "net", "process", "time"] }
+
+[build-dependencies]
+bindgen = "0.73"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

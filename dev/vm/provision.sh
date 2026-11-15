@@ -4,10 +4,29 @@
 set -euo pipefail
 user="$1"; vncpass="$2"; dns="${3:-}"; pubkey="${4:-}"
 
-# --- DNS: the default VM resolver may not work behind a VPN/Tailscale resolver ---
-if [ -n "$dns" ] && ! getent hosts archlinuxarm.org >/dev/null 2>&1; then
-  { for d in $dns; do echo "nameserver $d"; done; } > /etc/resolv.conf.ghostdrop
-  rm -f /etc/resolv.conf && cp /etc/resolv.conf.ghostdrop /etc/resolv.conf
+# --- DNS: the default VM resolver (vmnet gateway) fails behind a VPN/Tailscale
+# resolver, and the runtime rewrites /etc/resolv.conf on every boot, so reapply
+# our resolvers from a boot-time service.
+if [ -n "$dns" ]; then
+  install -d /etc/ghostdrop
+  { for d in $dns; do echo "nameserver $d"; done; } > /etc/ghostdrop/resolv.conf
+  cat > /etc/systemd/system/ghostdrop-dns.service <<'UNIT'
+[Unit]
+Description=Use public DNS resolvers (vmnet DNS is unreachable behind VPN resolvers)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-online.target nss-lookup.target sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cp /etc/ghostdrop/resolv.conf /etc/resolv.conf
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable ghostdrop-dns.service
+  cp /etc/ghostdrop/resolv.conf /etc/resolv.conf
 fi
 uid="$(id -u "$user")"; gid="$(id -g "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
 as_user() { sudo -u "$user" -H "$@"; }

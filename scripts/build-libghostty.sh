@@ -62,7 +62,7 @@ env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" "$ZIG" build \
   -Dapp-runtime=none \
   -Demit-xcframework=false \
   -Demit-macos-app=false \
-  -Demit-macos-static-lib=true \
+  -Demit-embed-lib=true \
   -Dmetal-runtime-compile=$METAL_RUNTIME \
   -Dsentry=false \
   -Di18n=false \

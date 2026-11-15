@@ -7,6 +7,7 @@
 #   dev/vm/vm.sh sync               rsync this repo to ~/ghostdrop in the machine
 #   dev/vm/vm.sh vnc x11|wayland    open the desktop in macOS Screen Sharing
 #   dev/vm/vm.sh shot x11|wayland [out.png]   screenshot a desktop over VNC (no GUI needed)
+#   dev/vm/vm.sh drive x11|wayland < script    drive a desktop over one VNC session (tests)
 #   dev/vm/vm.sh stop | start | destroy
 #
 # Isolation: the machine is created WITHOUT the default home-directory mount and
@@ -123,6 +124,14 @@ EOF
       wayland|sway) vncdo -s "$ip::5902" pause 2 capture "$out" ;;
     esac
     echo "$out"
+    ;;
+  drive)
+    # dev/vm/vm.sh drive x11|wayland < script   (see dev/vm/vnc_drive.py)
+    ip="$(need_ip)"; vncdo --version >/dev/null 2>&1 || true
+    case "${1:-x11}" in
+      x11) "$STATE/venv/bin/python" "$ROOT/dev/vm/vnc_drive.py" "$ip::5901" "$(vncpass)" ;;
+      wayland|sway) "$STATE/venv/bin/python" "$ROOT/dev/vm/vnc_drive.py" "$ip::5902" "" ;;
+    esac
     ;;
   start) c machine run -n "$NAME" -- true ;;
   stop) c machine stop "$NAME" ;;
