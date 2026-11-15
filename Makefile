@@ -25,7 +25,7 @@ FRAMEWORKS := AppKit Metal QuartzCore CoreText CoreGraphics CoreVideo IOSurface 
 SWIFTFLAGS := -O -wmo -swift-version 5 -target $(TARGET) -I $(MODULEDIR) \
               $(addprefix -framework ,$(FRAMEWORKS)) -lc++ -Xlinker -dead_strip
 
-.PHONY: all app libghostty run install dmg notarize clean distclean
+.PHONY: all app libghostty run install dmg notarize clean distclean pkg
 
 all: app
 
@@ -83,6 +83,10 @@ NOTARY_PROFILE ?= ghostdrop
 notarize: dmg
 	xcrun notarytool submit $(DMG) --keychain-profile $(NOTARY_PROFILE) --wait
 	xcrun stapler staple $(DMG)
+
+# Linux (Arch): build and install the package from this checkout (makepkg -si).
+pkg:
+	cd packaging/arch && makepkg -si
 
 clean:
 	rm -rf $(APPDIR) $(BUILD)/include

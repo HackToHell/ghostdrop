@@ -1,0 +1,65 @@
+# Builds Ghostdrop from this checkout (local changes included) and installs it
+# like any other package:
+#
+#   git clone --recurse-submodules https://github.com/HackToHell/ghostdrop
+#   cd ghostdrop/packaging/arch
+#   makepkg -si
+#
+# Then start it from your window manager (see the README).
+
+pkgname=ghostdrop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Fast drop-down (Quake-style) terminal on libghostty, for X11 and Wayland'
+arch=('x86_64' 'aarch64')
+url='https://github.com/HackToHell/ghostdrop'
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'libglvnd' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'fontconfig')
+optdepends=('mesa: GPU rendering on AMD/Intel, and libgbm for zero-copy presentation')
+makedepends=('git' 'rust' 'clang' 'pkgconf')
+# Zig and Cargo do their own optimisation and stripping.
+options=('!lto' '!debug')
+_zig=0.17.1
+source_x86_64=("https://ziglang.org/download/$_zig/zig-x86_64-linux-$_zig.tar.xz")
+source_aarch64=("https://ziglang.org/download/$_zig/zig-aarch64-linux-$_zig.tar.xz")
+sha256sums_x86_64=('3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a')
+sha256sums_aarch64=('a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795')
+
+# The repository this PKGBUILD lives in.
+_root="$(realpath "$startdir/../..")"
+
+prepare() {
+  if [ ! -f "$_root/vendor/ghostty/build.zig" ]; then
+    git -C "$_root" submodule update --init --depth 1 vendor/ghostty
+  fi
+  # Build from a copy so makepkg never writes into the checkout.
+  rm -rf "$srcdir/$pkgname"
+  mkdir -p "$srcdir/$pkgname"
+  tar -C "$_root" \
+    --exclude=./.git --exclude=./vendor/ghostty/.git \
+    --exclude=./build --exclude=./.tools --exclude=./linux/target \
+    --exclude=./packaging/arch/src --exclude=./packaging/arch/pkg \
+    --exclude='*.pkg.tar.*' --exclude='zig-*.tar.xz' \
+    --exclude=.zig-cache --exclude=zig-out \
+    -cf - . | tar -C "$srcdir/$pkgname" -xf -
+
+  cd "$srcdir/$pkgname/linux"
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export CARGO_HOME="$srcdir/cargo-home" CARGO_FLAGS=--frozen
+  export ZIG="$srcdir/zig-$CARCH-linux-$_zig/zig" ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache"
+  # The copy has no .git: keep git (used to apply patches) from finding one above.
+  export GIT_CEILING_DIRECTORIES="$srcdir"
+  scripts/build-linux.sh build
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  DESTDIR="$pkgdir" PREFIX=/usr scripts/build-linux.sh package
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 vendor/ghostty/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ghostty"
+}

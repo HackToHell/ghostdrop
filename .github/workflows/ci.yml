@@ -45,3 +45,46 @@ jobs:
           "$G" +version
           test -f build/Ghostdrop.app/Contents/Resources/AGENTS.md
           test -f build/Ghostdrop.app/Contents/Resources/terminfo/78/xterm-ghostty
+
+  linux:
+    name: linux (Arch, makepkg)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 60
+    steps:
+      # git first, so checkout fetches the submodule with git.
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf \
+            libglvnd libxcb libxkbcommon libxkbcommon-x11 fontconfig
+          useradd -m builder
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Cache Zig packages and crates
+        uses: actions/cache@v6
+        with:
+          path: |
+            packaging/arch/src/zig-cache
+            packaging/arch/src/cargo-home
+          key: linux-${{ hashFiles('patches/**', 'linux/Cargo.lock', 'packaging/arch/PKGBUILD') }}
+          restore-keys: linux-
+
+      - name: makepkg
+        run: |
+          chown -R builder: "$GITHUB_WORKSPACE"
+          cd packaging/arch
+          sudo -u builder env PKGDEST="$PWD" makepkg --noconfirm
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          pacman -U --noconfirm packaging/arch/ghostdrop-*.pkg.tar.*
+          GHOSTDROP_CONFIG="$RUNNER_TEMP/gd/config" ghostdrop check
+          ghostdrop +version
+          test -f /usr/share/doc/ghostdrop/AGENTS.md
+          test -f /usr/share/ghostdrop/terminfo/x/xterm-ghostty
+          test -d /usr/share/ghostdrop/ghostty/shell-integration
+          ldd /usr/bin/ghostdrop | grep -q /usr/lib/ghostdrop/libghostty.so
