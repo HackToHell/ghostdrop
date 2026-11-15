@@ -365,6 +365,7 @@ linux/examples/wlshot.rs  wlr-screencopy capture used by the Wayland tests
 scripts/build-linux.sh  builds libghostty (shared) + the Linux app, `install` to ~/.local
 packaging/arch/PKGBUILD makepkg package built from the checkout
 dev/vm/                 Arch Linux test VM (i3 + sway over VNC) and tests/
+dev/ci/linux-smoke.sh   CI check of an installed package (renders a frame on Xvfb)
 docs/testing.md         what was tested, how, and the results
 ```
 

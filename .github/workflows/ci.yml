@@ -56,7 +56,8 @@ jobs:
       - name: Install build tools
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf \
-            libglvnd libxcb libxkbcommon libxkbcommon-x11 fontconfig
+            libglvnd libxcb libxkbcommon libxkbcommon-x11 fontconfig \
+            mesa xorg-server-xvfb
           useradd -m builder
 
       - uses: actions/checkout@v7
@@ -78,13 +79,7 @@ jobs:
           cd packaging/arch
           sudo -u builder env PKGDEST="$PWD" makepkg --noconfirm
 
-      - name: Smoke test
+      - name: Install and smoke test
         run: |
-          set -euo pipefail
           pacman -U --noconfirm packaging/arch/ghostdrop-*.pkg.tar.*
-          GHOSTDROP_CONFIG="$RUNNER_TEMP/gd/config" ghostdrop check
-          ghostdrop +version
-          test -f /usr/share/doc/ghostdrop/AGENTS.md
-          test -f /usr/share/ghostdrop/terminfo/x/xterm-ghostty
-          test -d /usr/share/ghostdrop/ghostty/shell-integration
-          ldd /usr/bin/ghostdrop | grep -q /usr/lib/ghostdrop/libghostty.so
+          dev/ci/linux-smoke.sh
