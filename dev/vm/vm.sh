@@ -20,6 +20,9 @@ NAME="${GHOSTDROP_VM:-ghostdrop-arch}"
 IMAGE="ghostdrop-arch-dev:latest"
 VMUSER="dev"
 KEY="$STATE/id_ed25519"
+# The default resolver handed to VMs (the vmnet gateway) doesn't work when the Mac
+# uses a VPN/Tailscale resolver, so use public resolvers for this VM only.
+DNS="${GHOSTDROP_VM_DNS:-1.1.1.1 8.8.8.8}"
 mkdir -p "$STATE"
 
 # Never hand our ssh-agent to anything container-related.
@@ -62,7 +65,8 @@ case "$cmd" in
     command -v container >/dev/null || { echo "Install Apple's container tool first (see dev/vm/README.md)"; exit 1; }
     if ! c image inspect "$IMAGE" >/dev/null 2>&1; then
       echo "==> building $IMAGE"
-      c build --arch arm64 -t "$IMAGE" -f "$ROOT/dev/vm/Containerfile" "$ROOT/dev/vm"
+      dnsflags=(); for d in $DNS; do dnsflags+=(--dns "$d"); done
+      c build --arch arm64 "${dnsflags[@]}" -t "$IMAGE" -f "$ROOT/dev/vm/Containerfile" "$ROOT/dev/vm"
     fi
     if ! c machine inspect "$NAME" >/dev/null 2>&1; then
       echo "==> creating machine $NAME"
@@ -70,9 +74,18 @@ case "$cmd" in
         --home-mount none --user "$VMUSER"
     fi
     [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "ghostdrop-vm" -f "$KEY"
-    [ -f "$STATE/vnc-password" ] || LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8 > "$STATE/vnc-password"
+    [ -s "$STATE/vnc-password" ] || python3 -c 'import secrets,string; print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(8)), end="")' > "$STATE/vnc-password"
     echo "==> provisioning"
-    c machine run -n "$NAME" -- sudo /usr/local/sbin/ghostdrop-provision "$VMUSER" "$(vncpass)" < "$KEY.pub"
+    # `container machine run` joins argv with spaces and re-parses it with a shell, so
+    # ship the current provision script + its arguments as a single base64 token.
+    payload="$(python3 - "$ROOT/dev/vm/provision.sh" "$VMUSER" "$(vncpass)" "$DNS" "$(cat "$KEY.pub")" <<'PY'
+import base64, shlex, sys
+script, *args = sys.argv[1:]
+body = "set -- " + " ".join(shlex.quote(a) for a in args) + "\n" + open(script).read()
+print(base64.b64encode(body.encode()).decode())
+PY
+)"
+    c machine run -n "$NAME" -- echo "$payload" "|" base64 -d "|" sudo bash
     "$0" sync
     "$0" info
     ;;
@@ -106,8 +119,8 @@ EOF
   shot)
     ip="$(need_ip)"; kind="${1:-x11}"; out="${2:-$STATE/$kind.png}"
     case "$kind" in
-      x11) vncdo -s "$ip::5901" -p "$(vncpass)" capture "$out" ;;
-      wayland|sway) vncdo -s "$ip::5902" capture "$out" ;;
+      x11) vncdo -s "$ip::5901" -p "$(vncpass)" pause 1 capture "$out" ;;
+      wayland|sway) vncdo -s "$ip::5902" pause 2 capture "$out" ;;
     esac
     echo "$out"
     ;;

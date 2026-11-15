@@ -8,7 +8,8 @@ An Arch Linux ARM machine on Apple's [`container`](https://github.com/apple/cont
 | X11 + i3 | `5901` | TigerVNC `Xvnc`, VNC password in `.tools/vm/vnc-password` |
 | Wayland + sway | `5902` | sway + `wayvnc`, no password (host-only network) |
 
-`$mod` is **Alt** in both (Cmd/Super is taken by macOS over VNC). There's no GPU:
+`$mod` is **Alt** in both (⌥ Option on the Mac keyboard; Cmd/Super is taken by
+macOS over VNC). `Alt+Enter` opens a terminal, `Alt+d` a launcher. There's no GPU:
 OpenGL/EGL is Mesa llvmpipe, so it's functional, not representative of real
 performance.
 
@@ -43,3 +44,7 @@ VNC auth scheme), use TigerVNC Viewer: `brew install --cask tigervnc-viewer`.
 forwards your ssh-agent into the VM. `vm.sh` turns both off (`--home-mount none`,
 no `SSH_AUTH_SOCK`), uses its own ssh key (`.tools/vm/id_ed25519`), and copies the
 repo in with `sync`.
+
+Enter the VM through `dev/vm/vm.sh` (it strips `SSH_AUTH_SOCK`). A plain
+`container machine run` from a shell that has an ssh-agent forwards that agent into
+the VM for the duration of the session.

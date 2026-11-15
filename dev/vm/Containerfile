@@ -10,7 +10,9 @@ FROM docker.io/menci/archlinuxarm:latest
 
 ENV container=container
 
-RUN pacman-key --init && pacman-key --populate archlinuxarm && \
+# pacman 7's download sandbox (Landlock + alpm user) isn't permitted in containers.
+RUN sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && \
+    pacman-key --init && pacman-key --populate archlinuxarm && \
     pacman -Syu --noconfirm --needed \
       base-devel git openssh sudo dbus systemd iproute2 iputils curl wget rsync \
       vim less man-db htop jq python unzip \
@@ -19,7 +21,7 @@ RUN pacman-key --init && pacman-key --populate archlinuxarm && \
       wayland wayland-protocols libxkbcommon libxkbcommon-x11 \
       libx11 libxcb xcb-util xcb-util-wm xcb-util-keysyms libxrandr libxi libxcursor \
       fontconfig freetype2 harfbuzz oniguruma \
-      sway swaybg foot wayvnc wl-clipboard grim wtype wlr-randr \
+      sway swaybg foot wayvnc xorg-xwayland wl-clipboard grim wtype wlr-randr \
       i3-wm i3status dmenu xterm tigervnc \
       xorg-xprop xorg-xwininfo xorg-xrandr xorg-xdpyinfo xclip xdotool xorg-xwd imagemagick \
       ttf-dejavu noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd && \

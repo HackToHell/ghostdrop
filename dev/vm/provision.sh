@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Runs as root inside the machine: ghostdrop-provision <user> <vnc-password> < authorized_key.pub
+# Runs as root inside the machine:
+#   ghostdrop-provision <user> <vnc-password> "<dns servers>" "<ssh public key>"
 set -euo pipefail
-user="$1"; vncpass="$2"
+user="$1"; vncpass="$2"; dns="${3:-}"; pubkey="${4:-}"
+
+# --- DNS: the default VM resolver may not work behind a VPN/Tailscale resolver ---
+if [ -n "$dns" ] && ! getent hosts archlinuxarm.org >/dev/null 2>&1; then
+  { for d in $dns; do echo "nameserver $d"; done; } > /etc/resolv.conf.ghostdrop
+  rm -f /etc/resolv.conf && cp /etc/resolv.conf.ghostdrop /etc/resolv.conf
+fi
 uid="$(id -u "$user")"; gid="$(id -g "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
 as_user() { sudo -u "$user" -H "$@"; }
 
 # --- ssh access (key from the Mac side) ---
 install -d -m 700 -o "$user" -g "$gid" "$home/.ssh"
-cat > "$home/.ssh/authorized_keys"
+printf '%s\n' "$pubkey" > "$home/.ssh/authorized_keys"
 chown "$user:$gid" "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"
 systemctl enable --now sshd
 
@@ -22,8 +29,9 @@ sed -e 's/^set \$mod Mod4/set $mod Mod1/' /etc/i3/config > "$home/.config/i3/con
 cat >> "$home/.config/i3/config" <<'EOF'
 
 # --- ghostdrop dev VM ---
+# Arch's stock config uses Mod1 literally and never defines $mod.
+set $mod Mod1
 font pango:JetBrainsMono Nerd Font 10
-bindsym $mod+Return exec xterm
 include ~/.config/i3/ghostdrop.conf
 EOF
 touch "$home/.config/i3/ghostdrop.conf"
@@ -47,18 +55,22 @@ EOF
 chown -R "$user:$gid" "$home/.config"
 
 # --- the two desktops as services ---
+# Lingering keeps /run/user/$uid owned by systemd from boot; otherwise logind mounts a
+# fresh tmpfs over it on the first ssh login and hides the desktops' sockets.
+loginctl enable-linger "$user"
+pacman -S --noconfirm --needed xorg-xwayland >/dev/null
 for kind in x11 wayland; do
   cat > "/etc/systemd/system/ghostdrop-vnc-$kind.service" <<EOF
 [Unit]
 Description=Ghostdrop dev desktop ($kind) over VNC
-After=network-online.target
+After=network-online.target user-runtime-dir@$uid.service user@$uid.service
+Requires=user-runtime-dir@$uid.service
 
 [Service]
 User=$user
 Group=$gid
 WorkingDirectory=$home
 Environment=HOME=$home
-ExecStartPre=+/usr/bin/install -d -m 0700 -o $uid -g $gid /run/user/$uid
 ExecStart=/usr/local/bin/ghostdrop-$kind-session
 Restart=always
 RestartSec=2
@@ -68,5 +80,6 @@ WantedBy=multi-user.target
 EOF
 done
 systemctl daemon-reload
-systemctl enable --now ghostdrop-vnc-x11.service ghostdrop-vnc-wayland.service
+systemctl enable ghostdrop-vnc-x11.service ghostdrop-vnc-wayland.service
+systemctl restart ghostdrop-vnc-x11.service ghostdrop-vnc-wayland.service
 echo "provisioned for $user (uid $uid)"
