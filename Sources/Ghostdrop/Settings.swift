@@ -438,7 +438,8 @@ final class Settings {
     # quick-terminal-size = 50%
     # (main | mouse | macos-menu-bar)
     # quick-terminal-screen = mouse
-    # quick-terminal-animation-duration = 0.1
+    # (seconds; 0 = no slide animation)
+    # quick-terminal-animation-duration = 0
     # quick-terminal-autohide = true
 
     # Profiles: what a new tab runs. The built-in "shell" profile is your login shell.

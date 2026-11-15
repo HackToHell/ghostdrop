@@ -34,6 +34,10 @@
 	<string>A program running within Ghostdrop would like to use AppleScript.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>A program running within Ghostdrop would like to use Bluetooth.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ssh._tcp</string>
+	</array>
 	<key>NSCalendarsUsageDescription</key>
 	<string>A program running within Ghostdrop would like to access your Calendar.</string>
 	<key>NSCameraUsageDescription</key>

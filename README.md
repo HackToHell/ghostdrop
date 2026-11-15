@@ -47,8 +47,8 @@ no SwiftUI, no Combine, no Electron — and keeps out of the way:
 * tabs are kept alive and switched by toggling visibility (**~0.1 ms**); hidden
   tabs are marked occluded so their renderers idle;
 * **show ≈ 5–13 ms** of main-thread work (WindowServer order-front + activate),
-  then an optional slide (`quick-terminal-animation-duration`, default 0.1 s; `0`
-  = instant); **new tab ≈ 2–4 ms** on the main thread;
+  no animation by default (`quick-terminal-animation-duration = 0.1` for a slide);
+  **new tab ≈ 2–4 ms** on the main thread;
 * libghostty wakeups are coalesced; **0 % CPU** when hidden; App Nap is disabled
   so hidden tabs keep full-speed I/O and the hotkey never wakes a napping process;
 * throughput: ~240 MB/s of SGR-heavy output in a test (`cat` of 26 MB).
@@ -87,6 +87,15 @@ Notes:
   Metal; with full Xcode the shaders are precompiled as usual), and don't force
   `wait-after-command` for profile commands (so tabs close when their command
   exits, like iTerm).
+* **Local Network privacy (macOS 15+)**: macOS gates LAN / `.local` / Bonjour
+  access per app, *including child processes* (ssh, curl in your tabs). A
+  terminal never touches the LAN itself, so macOS may never ask and silently
+  deny ("No route to host" to LAN devices; internet and VPN hosts are fine).
+  Ghostdrop does a tiny Bonjour browse at launch to trigger the system prompt,
+  and if access is denied it shows a warning in the menu-bar item that opens
+  *Privacy & Security → Local Network*. Run it from the installed copy
+  (`make install`): the rule follows the registered app, and ad-hoc rebuilds run
+  from `build/` confuse it.
 * If **iTerm2's hotkey window** uses the same hotkey, disable it (iTerm2 →
   Settings → Profiles → Keys → Hotkey Window) or quit iTerm2.
 
@@ -95,7 +104,7 @@ Notes:
 `~/.config/ghostdrop/config` (created with comments on first run; `ghostdrop
 check` validates it). Same `key = value` syntax as Ghostty, and it's layered:
 
-1. Ghostdrop defaults (top, 50 % high, mouse screen, 0.1 s slide)
+1. Ghostdrop defaults (top, 50 % high, mouse screen, no animation)
 2. **your Ghostty config** (theme, fonts, keybinds, …) — `inherit-ghostty-config = false` to skip
 3. this file — any Ghostty option here overrides Ghostty for the drop-down only
 
@@ -105,7 +114,7 @@ check` validates it). Same `key = value` syntax as Ghostty, and it's layered:
 | `quick-terminal-position` | `top` | `top`, `bottom`, `left`, `right`, `center` |
 | `quick-terminal-size` | `50%` | `50%`, `50%,80%`, `600px` (primary,secondary). Dragging an edge overrides it (saved as a screen fraction, so it carries across monitors) until you double-click an edge or change this option |
 | `quick-terminal-screen` | `mouse` | `mouse`, `main`, `macos-menu-bar` |
-| `quick-terminal-animation-duration` | `0.1` | seconds; `0` = instant |
+| `quick-terminal-animation-duration` | `0` | seconds; `0` = instant, e.g. `0.1` for a slide |
 | `quick-terminal-autohide` | `true` | hide when focus moves elsewhere |
 | `profile.<name>.command` | | command for tabs of this profile (`shell` = login shell) |
 | `profile.<name>.term` | | `$TERM` override, e.g. `xterm-256color` for remote hosts |
@@ -160,6 +169,7 @@ Sources/Ghostdrop/
   DropController.swift  the panel: geometry, slide animation, autohide, tabs, search
   TabBarView.swift      custom-drawn tab bar
   ResizeHandle.swift    drag-to-resize strips on the free edges
+  LocalNetworkCheck.swift  triggers/detects macOS Local Network permission
   Hotkey.swift          Carbon global hotkey + IPC
   Settings.swift        config parsing, key combos, profiles
 patches/ghostty/        patches applied to vendor/ghostty before building

@@ -319,7 +319,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
         let screen = currentScreen()
         let target = targetFrame(on: screen)
-        let duration = runtime.double("quick-terminal-animation-duration", 0.1)
+        let duration = runtime.double("quick-terminal-animation-duration", 0)
         if NSApp.isHidden { NSApp.unhide(nil) }
 
         // Make the surface visible to the renderer before we appear.
@@ -386,7 +386,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         }
         previousApp = nil
 
-        let duration = runtime.double("quick-terminal-animation-duration", 0.1)
+        let duration = runtime.double("quick-terminal-animation-duration", 0)
         guard let screen = window.screen, duration > 0, position != .center, window.isOnActiveSpace else {
             finishHide()
             return

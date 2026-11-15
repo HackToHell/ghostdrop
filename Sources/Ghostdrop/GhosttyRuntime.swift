@@ -114,7 +114,7 @@ final class GhosttyRuntime {
     quick-terminal-position = top
     quick-terminal-size = 50%
     quick-terminal-screen = mouse
-    quick-terminal-animation-duration = 0.1
+    quick-terminal-animation-duration = 0
     quick-terminal-autohide = true
     """
 

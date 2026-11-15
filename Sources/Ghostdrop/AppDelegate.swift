@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     private var statusItem: NSStatusItem?
     private var hotkeyError: String?
     private var appearanceObservation: NSKeyValueObservation?
+    private let localNetwork = LocalNetworkCheck()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         settings = Settings.load()
@@ -39,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
 
         if settings.prespawn { drop.prepare() }
         reportErrors()
+
+        // Ask macOS for Local Network access up front (see LocalNetworkCheck).
+        localNetwork.onChange = { [weak self] status in self?.localNetworkChanged(status) }
+        localNetwork.run()
 
         if ProcessInfo.processInfo.environment["GHOSTDROP_SHOW_ON_LAUNCH"] == "1" { drop.show() }
     }
@@ -130,6 +135,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             NSWorkspace.shared.open(url)
         }
     }
+
+    private func localNetworkChanged(_ status: LocalNetworkCheck.Status) {
+        guard status == .denied else { return }
+        NSLog("ghostdrop: Local Network access is denied for Ghostdrop")
+        statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Ghostdrop")
+        // Explain once; afterwards the menu-bar item keeps a warning entry.
+        let key = "localNetworkWarned"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        let a = NSAlert()
+        a.messageText = "Ghostdrop can't access your local network"
+        a.informativeText = "macOS is blocking Local Network access for Ghostdrop, so ssh/curl to devices on your LAN (or .local hosts) from its tabs will fail with \"No route to host\". Internet and VPN hosts are not affected.\n\nTurn on Ghostdrop in System Settings → Privacy & Security → Local Network."
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Not Now")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn { LocalNetworkCheck.openSettings() }
+    }
+
+    @objc private func openLocalNetworkSettings() { LocalNetworkCheck.openSettings() }
 
     // MARK: - GhosttyRuntimeDelegate
 
@@ -223,6 +247,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             state["hotkeyError"] = hotkeyError ?? ""
             state["hotkey"] = hotkey.registered?.description ?? ""
             state["appActive"] = NSApp.isActive
+            state["localNetwork"] = "\(localNetwork.status)"
+            state["bundlePath"] = Bundle.main.bundlePath
             if let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: arg ?? "/tmp/ghostdrop-dump.json"))
             }
@@ -323,6 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if localNetwork.status == .denied { localNetwork.run() }
         menu.removeAllItems()
         let hk = settings.hotkey.map { " (\($0))" } ?? ""
         menu.addItem(withTitle: (drop.visible ? "Hide" : "Show") + hk, action: #selector(toggleDrop), keyEquivalent: "").target = self
@@ -342,6 +369,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         if let hotkeyError {
             let it = menu.addItem(withTitle: "⚠︎ " + hotkeyError, action: nil, keyEquivalent: "")
             it.isEnabled = false
+        }
+        if localNetwork.status == .denied {
+            menu.addItem(withTitle: "⚠︎ Local Network access is off — Open Settings…",
+                         action: #selector(openLocalNetworkSettings), keyEquivalent: "").target = self
         }
         if !settings.errors.isEmpty {
             menu.addItem(withTitle: "⚠︎ \(settings.errors.count) config issue(s)…", action: #selector(showErrors), keyEquivalent: "").target = self

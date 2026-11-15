@@ -43,10 +43,16 @@ run: app
 	-pkill -x ghostdrop; sleep 0.3
 	open $(APPDIR)
 
+LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Installs to a stable location and makes it the only registered copy, so
+# macOS privacy rules (Local Network, notifications, login item) attach to it.
 install: app
-	-pkill -x ghostdrop; sleep 0.3
+	-pkill -x ghostdrop; sleep 0.5
 	rm -rf $(PREFIX)/$(APP).app
-	cp -R $(APPDIR) $(PREFIX)/$(APP).app
+	ditto $(APPDIR) $(PREFIX)/$(APP).app
+	-$(LSREGISTER) -u $(abspath $(APPDIR))
+	$(LSREGISTER) -f $(PREFIX)/$(APP).app
 	@echo "==> installed to $(PREFIX)/$(APP).app"
 
 clean:
