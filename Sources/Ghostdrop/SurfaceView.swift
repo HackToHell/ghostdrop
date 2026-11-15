@@ -229,7 +229,8 @@ final class SurfaceView: NSView, NSTextInputClient {
         cursor = c
         window?.invalidateCursorRects(for: self)
         if let w = window, w.isKeyWindow,
-           bounds.contains(convert(w.mouseLocationOutsideOfEventStream, from: nil)) {
+           let content = w.contentView,
+           content.hitTest(content.convert(w.mouseLocationOutsideOfEventStream, from: nil)) === self {
             c.set()
         }
     }

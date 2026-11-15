@@ -13,6 +13,7 @@ cmd+1 … cmd+9     jump to tab                 cmd+w        close tab
 cmd+shift+←/→     move tab                    ctrl+shift+page_up/down  move tab
 cmd+f             search                      cmd+shift+,  reload config
 3-finger swipe    previous / next tab         middle-click tab  close
+drag free edge    resize (remembered)         double-click edge  reset size
 ```
 
 ## Why
@@ -102,7 +103,7 @@ check` validates it). Same `key = value` syntax as Ghostty, and it's layered:
 |---|---|---|
 | `hotkey` | `ctrl+grave_accent` | global show/hide (`none` to disable) |
 | `quick-terminal-position` | `top` | `top`, `bottom`, `left`, `right`, `center` |
-| `quick-terminal-size` | `50%` | `50%`, `50%,80%`, `600px` (primary,secondary) |
+| `quick-terminal-size` | `50%` | `50%`, `50%,80%`, `600px` (primary,secondary). Dragging an edge overrides it (saved as a screen fraction, so it carries across monitors) until you double-click an edge or change this option |
 | `quick-terminal-screen` | `mouse` | `mouse`, `main`, `macos-menu-bar` |
 | `quick-terminal-animation-duration` | `0.1` | seconds; `0` = instant |
 | `quick-terminal-autohide` | `true` | hide when focus moves elsewhere |
@@ -158,6 +159,7 @@ Sources/Ghostdrop/
   SurfaceView.swift     NSView hosting one surface: keyboard/IME/mouse → libghostty
   DropController.swift  the panel: geometry, slide animation, autohide, tabs, search
   TabBarView.swift      custom-drawn tab bar
+  ResizeHandle.swift    drag-to-resize strips on the free edges
   Hotkey.swift          Carbon global hotkey + IPC
   Settings.swift        config parsing, key combos, profiles
 patches/ghostty/        patches applied to vendor/ghostty before building

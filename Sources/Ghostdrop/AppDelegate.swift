@@ -234,6 +234,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             try? m.items.map { $0.title }.joined(separator: "\n").write(toFile: arg ?? "/tmp/ghostdrop-menu.txt", atomically: true, encoding: .utf8)
         case "goto-tab":
             if let n = arg.flatMap(Int32.init) { drop.gotoTab(n) }
+        case "resize":
+            // `resize <edge> <dx> <dy>`: hit-test the edge, then drag it by (dx, dy) points.
+            let parts = (arg ?? "").split(separator: " ").map(String.init)
+            guard parts.count == 3, let dx = Double(parts[1]), let dy = Double(parts[2]),
+                  let content = drop.window.contentView else { break }
+            let b = content.bounds
+            let p: NSPoint
+            switch parts[0] {
+            case "bottom": p = NSPoint(x: b.midX, y: 1)
+            case "top": p = NSPoint(x: b.midX, y: b.maxY - 1)
+            case "left": p = NSPoint(x: 1, y: b.midY)
+            default: p = NSPoint(x: b.maxX - 1, y: b.midY)
+            }
+            let hit = content.hitTest(p)
+            var log = "hit=\(hit.map { String(describing: type(of: $0)) } ?? "nil")"
+            if let h = hit as? ResizeHandle {
+                let start = drop.window.convertPoint(toScreen: content.convert(p, to: nil))
+                drop.beginResize(h.edge, at: start)
+                // Several steps, like a real drag.
+                for i in 1...5 {
+                    let f = CGFloat(i) / 5
+                    drop.resize(to: NSPoint(x: start.x + dx * f, y: start.y + dy * f))
+                }
+                drop.endResize()
+            }
+            log += " frame=\(NSStringFromRect(drop.window.frame))"
+            try? log.write(toFile: "/tmp/ghostdrop-resize.txt", atomically: true, encoding: .utf8)
+        case "reset-size":
+            drop.resetSize()
         case "close-tab":
             drop.perform(.closeTab)
         case "move-tab":

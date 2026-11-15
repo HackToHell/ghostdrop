@@ -11,6 +11,15 @@ final class DropPanel: NSPanel {
 final class DropContentView: NSView {
     let tabBar = TabBarView()
     let terminals = NSView()
+    /// Resize handles along the free edges (depends on the drop-down position).
+    var handles: [ResizeHandle] = [] {
+        didSet {
+            oldValue.forEach { $0.removeFromSuperview() }
+            handles.forEach { addSubview($0, positioned: .above, relativeTo: nil) }
+            needsLayout = true
+            relayout()
+        }
+    }
     var tabBarVisible = false { didSet { if oldValue != tabBarVisible { needsLayout = true; layoutSubtreeIfNeeded() } } }
     var tabBarAtTop = true { didSet { needsLayout = true } }
 
@@ -42,6 +51,15 @@ final class DropContentView: NSView {
             tabBar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: h)
             terminals.frame = NSRect(x: 0, y: h, width: bounds.width, height: bounds.height - h)
         }
+        let t = ResizeHandle.thickness
+        for handle in handles {
+            switch handle.edge {
+            case .bottom: handle.frame = NSRect(x: 0, y: 0, width: bounds.width, height: t)
+            case .top: handle.frame = NSRect(x: 0, y: bounds.height - t, width: bounds.width, height: t)
+            case .left: handle.frame = NSRect(x: 0, y: 0, width: t, height: bounds.height)
+            case .right: handle.frame = NSRect(x: bounds.width - t, y: 0, width: t, height: bounds.height)
+            }
+        }
     }
 }
 
@@ -69,7 +87,10 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     private var keyMonitor: Any?
     private var lastScreenFrame: NSRect?
     private var fullscreen = false
-    private var userResized: NSSize?
+    /// Size set by dragging an edge, as fractions of the screen's visible frame.
+    private var manualSize: (w: CGFloat, h: CGFloat)?
+    private var resizeStart: (edge: ResizeHandle.Edge, mouse: NSPoint, frame: NSRect)?
+    private var handlesPosition: DropPosition?
 
     // Search overlay.
     private let searchBar = NSView()
@@ -85,7 +106,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         content = DropContentView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
         window = DropPanel(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 400),
-            styleMask: [.borderless, .nonactivatingPanel, .resizable],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
         super.init()
 
@@ -103,6 +124,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
         content.tabBar.delegate = self
         setupSearchBar()
+        loadManualSize()
         applyAppearance()
 
         let nc = NotificationCenter.default
@@ -121,7 +143,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func apply(settings: Settings) {
         self.settings = settings
-        userResized = nil
+        loadManualSize()
         applyAppearance()
         if visible { window.setFrame(targetFrame(on: window.screen ?? currentScreen()), display: true) }
     }
@@ -157,7 +179,29 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             window.backgroundColor = bg
         }
         window.appearance = NSAppearance(named: isDark(bg) ? .darkAqua : .aqua)
+        updateHandles(color: fg)
         updateTabBar()
+    }
+
+    private func updateHandles(color: NSColor) {
+        let pos = position
+        if handlesPosition != pos {
+            handlesPosition = pos
+            let edges: [ResizeHandle.Edge]
+            switch pos {
+            case .top: edges = [.bottom, .left, .right]
+            case .bottom: edges = [.top, .left, .right]
+            case .left: edges = [.right, .top, .bottom]
+            case .right: edges = [.left, .top, .bottom]
+            case .center: edges = [.top, .bottom, .left, .right]
+            }
+            content.handles = edges.map { e in
+                let h = ResizeHandle(edge: e)
+                h.controller = self
+                return h
+            }
+        }
+        content.handles.forEach { $0.color = color }
     }
 
     private func isDark(_ c: NSColor) -> Bool {
@@ -210,7 +254,8 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     func targetFrame(on screen: NSScreen) -> NSRect {
         let vf = screen.visibleFrame
         if fullscreen { return vf }
-        var s = userResized ?? configuredSize(on: screen)
+        var s = manualSize.map { NSSize(width: vf.width * $0.w, height: vf.height * $0.h) }
+            ?? configuredSize(on: screen)
         s.width = min(s.width, vf.width)
         s.height = min(s.height, vf.height)
         let cx = round(vf.minX + (vf.width - s.width) / 2)
@@ -393,13 +438,84 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         selectedView?.clearBell()
     }
 
-    func windowDidResize(_ notification: Notification) {
-        guard visible, !animating, !fullscreen, let screen = window.screen else { return }
-        let f = window.frame
-        if f.size != targetFrame(on: screen).size { userResized = f.size }
-        // Keep it anchored to its edge.
-        let t = targetFrame(on: screen)
-        if t.origin != f.origin { window.setFrameOrigin(t.origin) }
+    // MARK: - Mouse resizing
+
+    static let minSize = NSSize(width: 300, height: 120)
+
+    func beginResize(_ edge: ResizeHandle.Edge, at mouse: NSPoint) {
+        fullscreen = false
+        resizeStart = (edge, mouse, window.frame)
+    }
+
+    func resize(to mouse: NSPoint) {
+        guard let start = resizeStart, let screen = window.screen else { return }
+        let vf = screen.visibleFrame
+        let dx = mouse.x - start.mouse.x, dy = mouse.y - start.mouse.y
+
+        // Edges perpendicular to the anchored side grow symmetrically (the
+        // window stays centered on that axis), so they need twice the delta.
+        let pos = position
+        let symmetric: Bool = {
+            switch (pos, start.edge) {
+            case (.center, _): return true
+            case (.top, .left), (.top, .right), (.bottom, .left), (.bottom, .right): return true
+            case (.left, .top), (.left, .bottom), (.right, .top), (.right, .bottom): return true
+            default: return false
+            }
+        }()
+        let k: CGFloat = symmetric ? 2 : 1
+        var w = start.frame.width, h = start.frame.height
+        switch start.edge {
+        case .bottom: h -= dy * k
+        case .top: h += dy * k
+        case .left: w -= dx * k
+        case .right: w += dx * k
+        }
+        w = min(max(w, Self.minSize.width), vf.width)
+        h = min(max(h, Self.minSize.height), vf.height)
+        manualSize = (w / vf.width, h / vf.height)
+        window.setFrame(targetFrame(on: screen), display: true)
+    }
+
+    func endResize() {
+        guard resizeStart != nil else { return }
+        resizeStart = nil
+        saveManualSize()
+    }
+
+    /// Identifies the config the saved size was made against; if you edit
+    /// quick-terminal-size/position the saved size is dropped.
+    private var sizeSignature: String {
+        let s = runtime.quickTerminalSize
+        func d(_ x: ghostty_quick_terminal_size_s) -> String {
+            switch x.tag {
+            case GHOSTTY_QUICK_TERMINAL_SIZE_PERCENTAGE: return "\(x.value.percentage)%"
+            case GHOSTTY_QUICK_TERMINAL_SIZE_PIXELS: return "\(x.value.pixels)px"
+            default: return "-"
+            }
+        }
+        return "\(position.rawValue)|\(d(s.primary))|\(d(s.secondary))"
+    }
+
+    private static let sizeKey = "manualSize"
+
+    private func saveManualSize() {
+        guard let m = manualSize else {
+            UserDefaults.standard.removeObject(forKey: Self.sizeKey)
+            return
+        }
+        UserDefaults.standard.set(["w": m.w, "h": m.h, "sig": sizeSignature], forKey: Self.sizeKey)
+    }
+
+    func loadManualSize() {
+        manualSize = nil
+        guard let d = UserDefaults.standard.dictionary(forKey: Self.sizeKey),
+              let w = d["w"] as? CGFloat, let h = d["h"] as? CGFloat, let sig = d["sig"] as? String else { return }
+        if sig == sizeSignature {
+            manualSize = (w, h)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.sizeKey)
+        }
     }
 
     @objc private func occlusionChanged() { updateOcclusion() }
@@ -425,7 +541,8 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     }
 
     func resetSize() {
-        userResized = nil
+        manualSize = nil
+        saveManualSize()
         fullscreen = false
         if visible { window.setFrame(targetFrame(on: window.screen ?? currentScreen()), display: true) }
     }
@@ -741,6 +858,8 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             "sheet": window.attachedSheet != nil,
             "search": !searchBar.isHidden ? "\(searchField.stringValue) [\(searchLabel.stringValue)]" : "",
             "tabBar": content.tabBarVisible,
+            "manualSize": manualSize.map { String(format: "%.3f x %.3f", $0.w, $0.h) } ?? "",
+            "handles": content.handles.map { "\($0.edge)" },
             "tabs": tabs.map { v -> [String: Any] in
                 let g = v.gridSize
                 return ["title": v.title, "profile": v.profile.name, "cols": g.cols, "rows": g.rows,
