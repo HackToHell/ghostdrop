@@ -278,6 +278,9 @@ final class Settings {
         return profiles[name] ?? defaultProfile
     }
 
+    /// True if this launch created the config file (i.e. first run).
+    private(set) static var createdTemplate = false
+
     static func load() -> Settings {
         let s = Settings()
         for (k, a) in defaultBindings {
@@ -286,6 +289,7 @@ final class Settings {
         let path = Settings.path
         if !FileManager.default.fileExists(atPath: path) {
             Settings.writeTemplate(to: path)
+            createdTemplate = true
         }
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return s }
         s.parse(text)
@@ -426,6 +430,9 @@ final class Settings {
     # then this file. Any key that isn't a Ghostdrop key below is passed straight to
     # libghostty, so you can override Ghostty settings for the drop-down only.
     # Reload with cmd+shift+, (Ghostty's reload_config) or from the menu bar icon.
+    #
+    # Want an AI agent to set this up for you? Menu bar icon → "Set Up with AI…",
+    # or point it at AGENTS.md in this folder (the full reference for this file).
 
     # Global hotkey that shows/hides the terminal. Works without Accessibility
     # permission. Examples: ctrl+grave_accent, alt+space, cmd+f12

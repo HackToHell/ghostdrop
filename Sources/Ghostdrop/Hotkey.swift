@@ -51,7 +51,7 @@ enum Control {
 
     static func send(_ args: [String]) -> Int32 {
         guard let cmd = args.first else {
-            FileHandle.standardError.write("usage: ghostdrop ctl toggle|show|hide|new-tab [profile]|reload\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: ghostdrop ctl toggle|show|hide|new-tab [profile]|next-tab|previous-tab|reload|login-item on|off\n".data(using: .utf8)!)
             return 2
         }
         var info: [String: String] = [:]

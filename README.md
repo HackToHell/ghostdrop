@@ -79,6 +79,41 @@ open /Applications/Ghostdrop.app
 
 Then enable *Launch at Login* from the menu-bar icon.
 
+### Distributing / installing for other people
+
+```sh
+make dmg                                   # build/Ghostdrop-<version>.dmg
+make dmg SIGN_IDENTITY="Developer ID Application: …" && make notarize   # for public downloads
+```
+
+The disk image contains `Ghostdrop.app`, an `Applications` shortcut to drag it onto,
+and **`Set Up with AI.md`**. If someone launches the app straight from the disk image,
+Ghostdrop offers to move itself to Applications. Ad-hoc builds (no Developer ID) need
+*System Settings → Privacy & Security → Open Anyway* on other Macs.
+
+## Set up with AI
+
+Ghostdrop ships an agent-oriented setup guide at a fixed path inside the app:
+
+```
+/Applications/Ghostdrop.app/Contents/Resources/AGENTS.md
+```
+
+It tells an AI coding agent (Claude Code, Codex, Cursor, Pi, …) how to inspect the
+user's current setup (Ghostty config, iTerm2 hotkey window), interview them, write
+`~/.config/ghostdrop/config`, validate it (`ghostdrop check`) and reload
+(`ghostdrop ctl reload`). It includes the full key/action reference, recipes and an
+iTerm2 migration map. It also gives the agent the bundled engine's own docs:
+`ghostdrop +show-config --default --docs`, `+explain-config <key>`, `+list-themes`,
+`+list-fonts`, `+list-keybinds`.
+
+How users get there:
+* first launch shows a welcome with **Copy AI Setup Prompt**;
+* menu-bar icon → **Set Up with AI…** copies a prompt with the correct path;
+* `~/.config/ghostdrop/AGENTS.md` and `CLAUDE.md` are symlinks to the guide, so an
+  agent started in that folder picks it up automatically;
+* the disk image includes it as `Set Up with AI.md`.
+
 Notes:
 * Ghostty is vendored as a submodule pinned to **v1.4.0** with three small patches
   (`patches/ghostty/`): install a plain `libghostty.a` on macOS without an
@@ -150,7 +185,9 @@ confirm-close-surface = false
 ```sh
 Ghostdrop.app/Contents/MacOS/ghostdrop ctl toggle|show|hide|next-tab|previous-tab|reload
 Ghostdrop.app/Contents/MacOS/ghostdrop ctl new-tab [profile]
+Ghostdrop.app/Contents/MacOS/ghostdrop ctl login-item on|off
 Ghostdrop.app/Contents/MacOS/ghostdrop check
+Ghostdrop.app/Contents/MacOS/ghostdrop +<ghostty-cli-action> …   # e.g. +list-themes --plain
 ```
 
 Relaunching the app (Spotlight, Finder, `open -a Ghostdrop`) also toggles it.
@@ -172,6 +209,7 @@ Sources/Ghostdrop/
   LocalNetworkCheck.swift  triggers/detects macOS Local Network permission
   Hotkey.swift          Carbon global hotkey + IPC
   Settings.swift        config parsing, key combos, profiles
+Resources/AGENTS.md     setup guide for AI agents (bundled into the app and the DMG)
 patches/ghostty/        patches applied to vendor/ghostty before building
 scripts/build-libghostty.sh
 ```

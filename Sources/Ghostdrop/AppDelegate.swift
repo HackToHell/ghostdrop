@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     private let localNetwork = LocalNetworkCheck()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if offerMoveToApplications() { return }
         settings = Settings.load()
         guard let rt = GhosttyRuntime(settings: settings) else {
             let a = NSAlert()
@@ -46,11 +47,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         localNetwork.run()
 
         if ProcessInfo.processInfo.environment["GHOSTDROP_SHOW_ON_LAUNCH"] == "1" { drop.show() }
+
+        linkSetupGuide()
+        if Settings.createdTemplate { DispatchQueue.main.async { self.showWelcome() } }
+    }
+
+    // MARK: - Install location
+
+    /// Launched straight from the disk image (or translocated by Gatekeeper)?
+    /// Offer to copy ourselves to Applications and relaunch from there, so the
+    /// login item, privacy permissions and the setup-guide path stay stable.
+    /// Returns true if we're relaunching.
+    private func offerMoveToApplications() -> Bool {
+        let path = Bundle.main.bundlePath
+        guard path.hasPrefix("/Volumes/") || path.contains("/AppTranslocation/") else { return false }
+        let a = NSAlert()
+        a.messageText = "Move Ghostdrop to Applications?"
+        a.informativeText = "Ghostdrop is running from the disk image. Move it to your Applications folder so it can "
+            + "start at login and keep its permissions."
+        a.addButton(withTitle: "Move to Applications")
+        a.addButton(withTitle: "Not Now")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return false }
+
+        let fm = FileManager.default
+        for dir in ["/Applications", (NSHomeDirectory() as NSString).appendingPathComponent("Applications")] {
+            let dest = (dir as NSString).appendingPathComponent("Ghostdrop.app")
+            do {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                if fm.fileExists(atPath: dest) {
+                    try fm.trashItem(at: URL(fileURLWithPath: dest), resultingItemURL: nil)
+                }
+                try fm.copyItem(atPath: path, toPath: dest)
+                let cfg = NSWorkspace.OpenConfiguration()
+                cfg.createsNewApplicationInstance = true
+                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: dest), configuration: cfg) { _, _ in
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                }
+                return true
+            } catch {
+                NSLog("ghostdrop: couldn't install to %@: %@", dir, error.localizedDescription)
+            }
+        }
+        let e = NSAlert()
+        e.messageText = "Couldn't move Ghostdrop"
+        e.informativeText = "Drag Ghostdrop.app from the disk image into your Applications folder, then open it from there."
+        e.runModal()
+        return false
+    }
+
+    // MARK: - AI setup
+
+    /// The agent-oriented setup guide shipped inside the bundle.
+    static var setupGuidePath: String? {
+        Bundle.main.path(forResource: "AGENTS", ofType: "md")
+    }
+
+    static var setupPrompt: String {
+        let guide = setupGuidePath ?? "/Applications/Ghostdrop.app/Contents/Resources/AGENTS.md"
+        return "Help me set up Ghostdrop, the drop-down terminal I just installed. Read \(guide) and follow it: "
+            + "look at my current setup (existing Ghostdrop, Ghostty and iTerm2 settings), ask me how I want it to "
+            + "behave, then write ~/.config/ghostdrop/config, validate it and reload Ghostdrop."
+    }
+
+    /// Symlinks the guide next to the config as AGENTS.md / CLAUDE.md, so an agent
+    /// started in ~/.config/ghostdrop picks it up automatically. Refreshed every
+    /// launch (the app may have moved); user-owned regular files are left alone.
+    private func linkSetupGuide() {
+        guard let guide = Self.setupGuidePath else { return }
+        let fm = FileManager.default
+        let dir = (Settings.path as NSString).deletingLastPathComponent
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let link = (dir as NSString).appendingPathComponent(name)
+            if let attrs = try? fm.attributesOfItem(atPath: link) {
+                guard attrs[.type] as? FileAttributeType == .typeSymbolicLink else { continue }
+                if (try? fm.destinationOfSymbolicLink(atPath: link)) == guide { continue }
+                try? fm.removeItem(atPath: link)
+            } else if (try? fm.destinationOfSymbolicLink(atPath: link)) != nil {
+                try? fm.removeItem(atPath: link) // dangling symlink
+            }
+            try? fm.createSymbolicLink(atPath: link, withDestinationPath: guide)
+        }
+    }
+
+    @objc func copySetupPrompt() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(Self.setupPrompt, forType: .string)
+        let a = NSAlert()
+        a.messageText = "AI setup prompt copied"
+        a.informativeText = "Paste it into an AI coding agent that can run commands on this Mac "
+            + "(Claude Code, Codex, Cursor, Pi, …). It points the agent at Ghostdrop's setup guide:\n\n"
+            + (Self.setupGuidePath ?? "")
+        a.addButton(withTitle: "OK")
+        a.addButton(withTitle: "Show Guide")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertSecondButtonReturn, let p = Self.setupGuidePath {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+        }
+    }
+
+    private func showWelcome() {
+        let a = NSAlert()
+        a.messageText = "Ghostdrop is running"
+        let hk = settings.hotkey?.description ?? "the menu-bar icon"
+        a.informativeText = "Press \(hk) anywhere to drop down the terminal; press it again to hide it. "
+            + "Ghostdrop lives in the menu bar — there's no Dock icon.\n\n"
+            + "Want an AI assistant to configure it for you (hotkey, size, profiles, theme, shortcuts)? "
+            + "Copy a setup prompt and paste it into your AI coding agent."
+        a.addButton(withTitle: "Copy AI Setup Prompt")
+        a.addButton(withTitle: "Open Terminal")
+        a.addButton(withTitle: "Done")
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn: copySetupPrompt()
+        case .alertSecondButtonReturn: drop.show()
+        default: break
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         // Launching the app again (Finder, Spotlight, `open -a`) toggles it.
-        drop.toggle()
+        drop?.toggle()
         return false
     }
 
@@ -222,6 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         case "next-tab": drop.perform(.nextTab)
         case "previous-tab": drop.perform(.previousTab)
         case "reload": reloadConfig()
+        case "login-item": setLoginItem(arg == "on")
         default:
             guard settings.controlCommands || ProcessInfo.processInfo.environment["GHOSTDROP_DEBUG"] == "1" else { return }
             debugCommand(cmd, arg: arg)
@@ -377,6 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         if !settings.errors.isEmpty {
             menu.addItem(withTitle: "⚠︎ \(settings.errors.count) config issue(s)…", action: #selector(showErrors), keyEquivalent: "").target = self
         }
+        menu.addItem(withTitle: "Set Up with AI…", action: #selector(copySetupPrompt), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Open Config", action: #selector(openConfig), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Reload Config", action: #selector(reloadFromMenu), keyEquivalent: "").target = self
         let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
@@ -401,6 +520,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         a.informativeText = settings.errors.joined(separator: "\n")
         NSApp.activate(ignoringOtherApps: true)
         a.runModal()
+    }
+
+    private func setLoginItem(_ on: Bool) {
+        let enabled = SMAppService.mainApp.status == .enabled
+        guard on != enabled else { return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            NSLog("ghostdrop: login item: %@", error.localizedDescription)
+        }
     }
 
     @objc private func toggleLoginItem() {

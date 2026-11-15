@@ -14,7 +14,16 @@ for v in ["GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR", "GHOSTTY_SHELL_FEATURES", 
     unsetenv(v)
 }
 
-// Initialize libghostty's global state. Only argv[0]: our arguments aren't Ghostty CLI actions.
+// Initialize libghostty's global state. Normally only argv[0]: our arguments aren't
+// Ghostty CLI actions. `ghostdrop +<action> ...` runs a Ghostty CLI action instead
+// (+show-config --default --docs, +explain-config, +list-themes, +list-fonts, ...),
+// which is how agents/users get the reference for the bundled engine version.
+if args.count >= 2 && args[1].hasPrefix("+") {
+    var argv = args.map { strdup($0) } + [nil]
+    if ghostty_init(UInt(args.count), &argv) != GHOSTTY_SUCCESS { exit(1) }
+    ghostty_cli_try_action()  // exits
+    exit(0)
+}
 var argv0: [UnsafeMutablePointer<CChar>?] = [strdup(args[0]), nil]
 if ghostty_init(1, &argv0) != GHOSTTY_SUCCESS {
     FileHandle.standardError.write("ghostdrop: ghostty_init failed\n".data(using: .utf8)!)
