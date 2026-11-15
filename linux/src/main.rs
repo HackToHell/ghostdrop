@@ -10,9 +10,12 @@
 #![allow(clippy::unnecessary_cast)]
 // x11.rs uses an immediately-invoked closure as a try-block.
 #![allow(clippy::redundant_closure_call, clippy::too_many_arguments)]
+// `as_chunks` needs Rust 1.88; keep building on older toolchains.
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 mod core;
 mod draw;
+mod drm;
 mod ffi;
 mod ghostty;
 mod ipc;

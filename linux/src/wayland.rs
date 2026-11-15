@@ -15,6 +15,8 @@ use smithay_client_toolkit::{
     },
     delegate_registry,
     dispatch2::Dispatch2,
+    dmabuf::{DmabufFeedback, DmabufHandler, DmabufState},
+    subcompositor::SubcompositorState,
     output::{OutputHandler, OutputState},
     primary_selection::{
         device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
@@ -33,8 +35,14 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use crate::tab::Frame;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use wayland_client::protocol::{wl_buffer::WlBuffer, wl_subsurface::WlSubsurface};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+};
 use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
@@ -55,6 +63,52 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_view
 use xkbcommon::xkb;
 
 const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+
+/// Zero-copy presentation: DMA-BUF frames become wl_buffers
+/// (linux-dmabuf) on a subsurface over the terminal area.
+struct WlGpu {
+    sub: Option<GpuSurface>,
+    buffers: Vec<(GpuKey, GpuBuf, u64)>,
+    clock: u64,
+    frame_pending: bool,
+}
+
+type GpuKey = (u64, u32, u32, u32, u64);
+
+enum GpuBuf {
+    /// `create` sent; the compositor answers with created/failed.
+    Pending(ZwpLinuxBufferParamsV1),
+    Ready(WlBuffer),
+}
+
+struct GpuSurface {
+    subsurface: WlSubsurface,
+    surface: wl_surface::WlSurface,
+    viewport: Option<WpViewport>,
+    mapped: bool,
+}
+
+impl WlGpu {
+    fn drop_surface(&mut self) {
+        if let Some(s) = self.sub.take() {
+            if let Some(v) = s.viewport {
+                v.destroy();
+            }
+            s.subsurface.destroy();
+            s.surface.destroy();
+        }
+        for (_, b, _) in self.buffers.drain(..) {
+            match b {
+                GpuBuf::Pending(p) => p.destroy(),
+                GpuBuf::Ready(b) => b.destroy(),
+            }
+        }
+        self.frame_pending = false;
+    }
+}
+
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 pub struct WlWin {
     conn: Connection,
@@ -88,6 +142,13 @@ pub struct WlWin {
     kb_focus: bool,
     logical: (u32, u32),
     scale: i32,
+    dmabuf: DmabufState,
+    subcompositor: Option<SubcompositorState>,
+    gpu: Option<WlGpu>,
+    /// GPU setup from the compositor's dmabuf feedback is done (or moot).
+    gpu_probed: bool,
+    /// A new GPU frame waits to be presented.
+    needs_present: bool,
     /// Mapping is waiting for the output-size probe (see `show`).
     probe: Option<Placement>,
     /// Logical size of the output the compositor put this surface on.
@@ -197,6 +258,110 @@ impl WlWin {
         });
     }
 
+    /// Put the GPU subsurface over the terminal (`rect`, physical px) or
+    /// take it away (`None`: CPU frames). Its position is parent state, so
+    /// call this before committing the main surface.
+    fn place_gpu_surface(&mut self, rect: Option<(u32, u32, u32, u32)>) {
+        let scale = self.scale_f();
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let Some(r) = rect else {
+            if let Some(s) = gpu.sub.as_mut().filter(|s| s.mapped) {
+                s.surface.attach(None, 0, 0);
+                s.surface.commit();
+                s.mapped = false;
+            }
+            return;
+        };
+        let Some(layer) = self.layer.as_ref() else { return };
+        if gpu.sub.is_none() {
+            let Some(sc) = self.subcompositor.as_ref() else { return };
+            let (subsurface, surface) = sc.create_subsurface(layer.wl_surface().clone(), &self.qh);
+            // Frames arrive at their own pace; don't tie them to the parent.
+            subsurface.set_desync();
+            // Pointer input goes to the main surface underneath.
+            if let Ok(region) = smithay_client_toolkit::compositor::Region::new(&self.compositor) {
+                surface.set_input_region(Some(region.wl_region()));
+            }
+            let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, NoEvents));
+            gpu.sub = Some(GpuSurface { subsurface, surface, viewport, mapped: false });
+        }
+        let s = gpu.sub.as_ref().unwrap();
+        s.subsurface.set_position((r.0 as f64 / scale).round() as i32, (r.1 as f64 / scale).round() as i32);
+    }
+
+    /// Present a DMA-BUF frame on the subsurface. Ok(false) = try again
+    /// later (previous frame not shown yet, or the buffer is being created).
+    fn present_gpu(&mut self, frame: &Frame, rect: (u32, u32, u32, u32)) -> Result<bool, String> {
+        let fractional = self.fractional();
+        let (scale, iscale) = (self.scale_f(), self.scale);
+        let Some(gpu) = self.gpu.as_mut() else { return Ok(false) };
+        let Some(d) = frame.dmabuf() else { return Ok(true) };
+        if gpu.frame_pending || gpu.sub.is_none() {
+            return Ok(false);
+        }
+        // Wait for a frame that fits (resizes take a frame to catch up).
+        if frame.width > rect.2 || frame.height > rect.3 {
+            return Ok(true);
+        }
+        gpu.clock += 1;
+        let key: GpuKey = (d.ino, frame.width, frame.height, d.strides[0], d.modifier);
+        let buffer = match gpu.buffers.iter_mut().find(|b| b.0 == key) {
+            Some((_, GpuBuf::Ready(b), used)) => {
+                *used = gpu.clock;
+                b.clone()
+            }
+            Some((_, GpuBuf::Pending(_), _)) => return Ok(false),
+            None => {
+                let params = self.dmabuf.create_params(&self.qh).map_err(|e| e.to_string())?;
+                for i in 0..d.n_planes {
+                    let fd = unsafe { BorrowedFd::borrow_raw(d.fds[i]) };
+                    params.add(fd, i as u32, d.offsets[i], d.strides[i], d.modifier);
+                }
+                let p = params.create(frame.width as i32, frame.height as i32, d.fourcc, zwp_linux_buffer_params_v1::Flags::empty());
+                crate::core::trace!(
+                    "gpu: creating {}x{} fourcc={:#x} modifier={:#x} planes={}",
+                    frame.width, frame.height, d.fourcc, d.modifier, d.n_planes
+                );
+                gpu.buffers.push((key, GpuBuf::Pending(p), gpu.clock));
+                if gpu.buffers.len() > 6 {
+                    let (i, _) = gpu.buffers.iter().enumerate().min_by_key(|(_, b)| b.2).unwrap();
+                    match gpu.buffers.remove(i).1 {
+                        GpuBuf::Pending(p) => p.destroy(),
+                        GpuBuf::Ready(b) => b.destroy(),
+                    }
+                }
+                return Ok(false);
+            }
+        };
+        let s = gpu.sub.as_mut().unwrap();
+        s.surface.attach(Some(&buffer), 0, 0);
+        match s.viewport.as_ref().filter(|_| fractional) {
+            Some(vp) => {
+                s.surface.set_buffer_scale(1);
+                vp.set_destination(
+                    ((frame.width as f64 / scale).round() as i32).max(1),
+                    ((frame.height as f64 / scale).round() as i32).max(1),
+                );
+            }
+            None => s.surface.set_buffer_scale(iscale),
+        }
+        s.surface.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
+        s.surface.frame(&self.qh, smithay_client_toolkit::compositor::FrameCallbackData(s.surface.clone()));
+        s.surface.commit();
+        s.mapped = true;
+        gpu.frame_pending = true;
+        Ok(true)
+    }
+
+    fn disable_gpu(&mut self, why: &str) {
+        if let Some(mut g) = self.gpu.take() {
+            eprintln!("ghostdrop: GPU presentation off ({why}); using CPU frames");
+            g.drop_surface();
+        }
+        self.needs_present = false;
+        self.needs_redraw = true;
+    }
+
     fn stop_repeat(&mut self) {
         self.repeat_key = None;
         if let Some(t) = self.repeat_token.take() {
@@ -248,6 +413,11 @@ impl Window for WlWin {
 
     fn hide(&mut self) {
         self.stop_repeat();
+        // libghostty drops its GPU buffers while hidden; let go of ours too.
+        if let Some(g) = self.gpu.as_mut() {
+            g.drop_surface();
+        }
+        self.needs_present = false;
         if let Some(f) = self.frac.take() {
             f.destroy();
         }
@@ -285,6 +455,14 @@ impl Window for WlWin {
 
     fn request_redraw(&mut self) {
         self.needs_redraw = true;
+    }
+
+    fn request_present(&mut self) {
+        if self.gpu.is_some() {
+            self.needs_present = true;
+        } else {
+            self.needs_redraw = true;
+        }
     }
 
     fn set_cursor(&mut self, c: Cursor) {
@@ -415,6 +593,32 @@ impl WlState {
         if ghostty::has_pending() {
             self.core.process(&mut self.win);
         }
+        self.redraw();
+        self.present();
+    }
+
+    /// Present a pending GPU frame on the subsurface.
+    fn present(&mut self) {
+        let w = &mut self.win;
+        if !(w.needs_present && w.visible && w.configured && w.gpu.is_some()) {
+            return;
+        }
+        let size = w.physical();
+        match self.core.gpu_frame(size, w.scale_f()) {
+            None => w.needs_present = false,
+            Some((frame, rect)) => match w.present_gpu(frame, rect) {
+                Ok(true) => w.needs_present = false,
+                Ok(false) => {}
+                Err(e) => {
+                    w.disable_gpu(&e);
+                    self.core.set_gpu_backend(false);
+                }
+            },
+        }
+    }
+
+    /// Compose and commit the main surface (chrome, or everything on CPU frames).
+    fn redraw(&mut self) {
         let w = &mut self.win;
         if !(w.needs_redraw && w.visible && w.configured && !w.frame_pending) {
             return;
@@ -444,10 +648,19 @@ impl WlState {
         }
         surface.damage_buffer(0, 0, pw as i32, ph as i32);
         surface.frame(&w.qh, smithay_client_toolkit::compositor::FrameCallbackData(surface.clone()));
-        if buffer.attach_to(surface).is_ok() {
+        // The terminal comes from the GPU subsurface when the frame is a
+        // DMA-BUF; position it (parent state) before this commit.
+        let gpu_rect = w.gpu.as_ref().and(self.core.gpu_frame((pw, ph), scale)).map(|(_, r)| r);
+        let surface = surface.clone();
+        let layer = layer.clone();
+        w.place_gpu_surface(gpu_rect);
+        if buffer.attach_to(&surface).is_ok() {
             layer.commit();
             w.frame_pending = true;
             w.needs_redraw = false;
+            if gpu_rect.is_some() {
+                w.needs_present = true;
+            }
         }
     }
 }
@@ -458,6 +671,7 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
     let qh = queue.handle();
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| "compositor has no wlr-layer-shell".to_string())?;
     let compositor = CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).ok();
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
 
     let mut event_loop: calloop::EventLoop<'static, WlState> = calloop::EventLoop::try_new().map_err(|e| e.to_string())?;
@@ -524,6 +738,11 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         logical: (0, 0),
         scale: 1,
         scale120: 0,
+        dmabuf: DmabufState::new(&globals, &qh),
+        subcompositor,
+        gpu: None,
+        gpu_probed: false,
+        needs_present: false,
         probe: None,
         known_output: None,
         frac_mgr: globals.bind::<WpFractionalScaleManagerV1, WlState, NoEvents>(&qh, 1..=1, NoEvents).ok(),
@@ -543,8 +762,22 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         pointer_left_at: None,
     };
     let mut st = WlState { win, core: core_builder() };
-    // Let outputs/seats arrive before sizing anything.
+    // Zero-copy presentation needs to know the compositor's GPU and formats
+    // before the first surface exists (libghostty renders on that GPU).
+    let gpu_wanted = std::env::var("GHOSTDROP_GPU").as_deref() != Ok("0")
+        && st.win.subcompositor.is_some()
+        && st.win.dmabuf.version().is_some_and(|v| v >= 4);
+    if gpu_wanted {
+        let _ = st.win.dmabuf.get_default_feedback(&qh);
+    } else {
+        st.win.gpu_probed = true;
+    }
+    // Let outputs/seats (and dmabuf feedback) arrive before sizing anything.
+    let deadline = Instant::now() + Duration::from_millis(300);
     event_loop.dispatch(Some(Duration::from_millis(50)), &mut st).map_err(|e| e.to_string())?;
+    while !st.win.gpu_probed && Instant::now() < deadline {
+        event_loop.dispatch(Some(Duration::from_millis(20)), &mut st).map_err(|e| e.to_string())?;
+    }
     st.core.prespawn(&mut st.win);
     if show_now {
         st.core.show(&mut st.win);
@@ -576,8 +809,11 @@ impl CompositorHandler for WlState {
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        self.win.frame_pending = false;
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        match self.win.gpu.as_mut() {
+            Some(g) if g.sub.as_ref().is_some_and(|s| &s.surface == surface) => g.frame_pending = false,
+            _ => self.win.frame_pending = false,
+        }
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -942,6 +1178,58 @@ impl Dispatch2<WpFractionalScaleV1, WlState> for FracData {
             }
         }
     }
+}
+
+impl DmabufHandler for WlState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.win.dmabuf
+    }
+
+    fn dmabuf_feedback(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpLinuxDmabufFeedbackV1, feedback: DmabufFeedback) {
+        if self.win.gpu_probed {
+            return; // later updates can't move libghostty to another GPU
+        }
+        self.win.gpu_probed = true;
+        let mut mods: Vec<u64> = feedback
+            .format_table()
+            .iter()
+            .filter(|f| f.format == DRM_FORMAT_ARGB8888 && f.modifier != DRM_FORMAT_MOD_INVALID)
+            .map(|f| f.modifier)
+            .collect();
+        mods.sort_unstable();
+        mods.dedup();
+        let node = crate::drm::render_node_for_dev(feedback.main_device());
+        crate::core::trace!("gpu: compositor device {node:?}, {} ARGB8888 modifiers", mods.len());
+        if let Some(n) = &node {
+            ghostty::set_render_device(n);
+        }
+        ghostty::set_present_modifiers(&mods);
+        self.win.gpu = Some(WlGpu { sub: None, buffers: Vec::new(), clock: 0, frame_pending: false });
+        self.core.set_gpu_backend(true);
+    }
+
+    fn created(&mut self, _: &Connection, _: &QueueHandle<Self>, params: &ZwpLinuxBufferParamsV1, buffer: WlBuffer) {
+        let Some(g) = self.win.gpu.as_mut() else {
+            buffer.destroy();
+            return;
+        };
+        match g.buffers.iter_mut().find(|b| matches!(&b.1, GpuBuf::Pending(p) if p == params)) {
+            Some(b) => {
+                b.1 = GpuBuf::Ready(buffer);
+                self.win.needs_present = true;
+            }
+            None => buffer.destroy(),
+        }
+        params.destroy();
+    }
+
+    fn failed(&mut self, _: &Connection, _: &QueueHandle<Self>, params: &ZwpLinuxBufferParamsV1) {
+        params.destroy();
+        self.win.disable_gpu("the compositor could not import a frame");
+        self.core.set_gpu_backend(false);
+    }
+
+    fn released(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlBuffer) {}
 }
 
 impl ProvidesRegistryState for WlState {

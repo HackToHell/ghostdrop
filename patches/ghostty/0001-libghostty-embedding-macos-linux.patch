@@ -1,0 +1,1049 @@
+diff --git a/build.zig b/build.zig
+index 85a91fb..0410c48 100644
+--- a/build.zig
++++ b/build.zig
+@@ -223,6 +223,14 @@ pub fn build(b: *std.Build) !void {
+         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
+         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
+ 
++        // Plain static lib + header + resources for embedders that link
++        // libghostty directly (macOS without the xcframework, and Linux).
++        if (config.emit_embed_lib) {
++            lib_shared.installHeader();
++            lib_static.install("libghostty.a");
++            resources.install();
++        }
++
+         // We shouldn't have this guard but we don't currently
+         // build on macOS this way ironically so we need to fix that.
+         if (!config.target.result.os.tag.isDarwin()) {
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 9a12b9c..7a60045 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -70,6 +70,7 @@ typedef enum {
+   GHOSTTY_PLATFORM_INVALID,
+   GHOSTTY_PLATFORM_MACOS,
+   GHOSTTY_PLATFORM_IOS,
++  GHOSTTY_PLATFORM_LINUX,
+ } ghostty_platform_e;
+ 
+ typedef enum {
+@@ -520,6 +521,29 @@ typedef struct {
+   ghostty_surface_context_e context;
+ } ghostty_surface_config_s;
+ 
++// A rendered frame pulled by Linux embedders (see ghostty_surface_take_frame).
++typedef enum {
++  GHOSTTY_FRAME_MEMORY = 0,
++  GHOSTTY_FRAME_DMABUF = 1,
++} ghostty_frame_kind_e;
++
++typedef struct {
++  int kind;  // ghostty_frame_kind_e
++  uint32_t width;
++  uint32_t height;
++  bool flip_y;  // rows are bottom-up
++  bool premultiplied;
++  const uint8_t* pixels;  // GHOSTTY_FRAME_MEMORY: BGRA8 (premultiplied)
++  size_t stride;
++  uint32_t fourcc;  // GHOSTTY_FRAME_DMABUF: top-down DRM_FORMAT_ARGB8888
++  uint64_t modifier;
++  uint32_t n_planes;
++  int32_t fds[4];
++  uint32_t offsets[4];
++  uint32_t strides[4];
++  void* handle;  // pass to ghostty_frame_free
++} ghostty_frame_s;
++
+ typedef struct {
+   uint16_t columns;
+   uint16_t rows;
+@@ -1241,6 +1265,13 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
+                                               ghostty_text_s*);
+ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+ 
++// Linux embedders: pull rendered frames (on GHOSTTY_ACTION_RENDER).
++GHOSTTY_API bool ghostty_surface_take_frame(ghostty_surface_t, ghostty_frame_s*);
++GHOSTTY_API void ghostty_frame_free(void*);
++GHOSTTY_API void ghostty_surface_set_gpu_frames(ghostty_surface_t, bool);
++GHOSTTY_API void ghostty_set_render_device(const char*);
++GHOSTTY_API void ghostty_set_present_modifiers(const uint64_t*, size_t);
++
+ #ifdef __APPLE__
+ GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
+ GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 697f0a7..2fbe114 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -382,6 +382,10 @@ pub const App = struct {
+ pub const Platform = union(PlatformTag) {
+     macos: MacOS,
+     ios: IOS,
++    /// Linux embedders own their windowing (Wayland/X11) and pull rendered
++    /// frames with `ghostty_surface_take_frame` when the surface reports
++    /// GHOSTTY_ACTION_RENDER. No native handle is needed.
++    linux: void,
+ 
+     // If our build target for libghostty is not darwin then we do
+     // not include macos support at all.
+@@ -424,6 +428,11 @@ pub const Platform = union(PlatformTag) {
+                     break :ios error.UIViewMustBeSet);
+                 break :ios .{ .ios = .{ .uiview = uiview } };
+             } else error.UnsupportedPlatform,
++
++            .linux => if (comptime builtin.target.os.tag == .linux)
++                .{ .linux = {} }
++            else
++                error.UnsupportedPlatform,
+         };
+     }
+ };
+@@ -434,6 +443,35 @@ pub const PlatformTag = enum(c_int) {
+ 
+     macos = 1,
+     ios = 2,
++    linux = 3,
++};
++
++/// A rendered frame handed to an embedder (Linux). Mirrors ghostty_frame_s.
++/// ghostdrop: see ghostty_set_render_device.
++var render_device_path: [256:0]u8 = @splat(0);
++var render_device_display: if (@hasDecl(renderer.Device, "displayForDrmNode")) ?*@import("opengl").egl.Display else void =
++    if (@hasDecl(renderer.Device, "displayForDrmNode")) null else {};
++
++pub const FrameC = extern struct {
++    /// 0 = CPU memory (RGBA8), 1 = DMA-BUF.
++    kind: c_int = 0,
++    width: u32 = 0,
++    height: u32 = 0,
++    /// Rows are bottom-up (OpenGL origin); the embedder must flip vertically.
++    flip_y: bool = false,
++    premultiplied: bool = true,
++    /// kind == memory: tightly packed BGRA8 rows (premultiplied).
++    pixels: ?[*]const u8 = null,
++    stride: usize = 0,
++    /// kind == dmabuf
++    fourcc: u32 = 0,
++    modifier: u64 = 0,
++    n_planes: u32 = 0,
++    fds: [4]i32 = .{ -1, -1, -1, -1 },
++    offsets: [4]u32 = .{ 0, 0, 0, 0 },
++    strides: [4]u32 = .{ 0, 0, 0, 0 },
++    /// Opaque; pass to ghostty_frame_free once the frame is no longer used.
++    handle: ?*anyopaque = null,
+ };
+ 
+ pub const EnvVar = extern struct {
+@@ -569,7 +607,8 @@ pub const Surface = struct {
+             const cmd = std.mem.sliceTo(c_command, 0);
+             if (cmd.len > 0) {
+                 config.command = .{ .shell = cmd };
+-                config.@"wait-after-command" = true;
++                // ghostdrop: don't force wait-after-command for custom
++                // commands; the embedder decides via `wait_after_command`.
+             }
+         }
+ 
+@@ -1253,6 +1292,18 @@ pub const Surface = struct {
+     pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
+         // The Metal renderer currently does not have any options
+         _ = self;
++        if (comptime @hasDecl(renderer.Device, "displayForDrmNode")) {
++            // ghostdrop: render on the GPU the embedder presents on.
++            if (render_device_display) |d| return .{ .display = d };
++            const len = std.mem.indexOfScalar(u8, &render_device_path, 0) orelse 0;
++            if (len > 0) {
++                const path = render_device_path[0..len :0];
++                if (renderer.Device.displayForDrmNode(path)) |d| {
++                    render_device_display = d;
++                    return .{ .display = d };
++                } else |err| log.warn("render device {s} unavailable err={}", .{ path, err });
++            }
++        }
+         return .{};
+     }
+ };
+@@ -1700,6 +1751,95 @@ pub const CAPI = struct {
+         }
+     }
+ 
++    /// Take the most recently rendered frame of a surface, if any (Linux).
++    /// Returns false if no new frame is available. The caller owns the
++    /// frame and must release it with ghostty_frame_free.
++    export fn ghostty_surface_take_frame(surface: *Surface, out: *FrameC) bool {
++        const ExportedFrame = renderer.Renderer.ExportedFrame;
++        if (comptime ExportedFrame == void) return false;
++
++        const frame = surface.core_surface.renderer.takeFrame() orelse return false;
++        const box = std.heap.c_allocator.create(ExportedFrame) catch {
++            frame.deinit();
++            return false;
++        };
++        box.* = frame;
++
++        var c: FrameC = .{ .handle = box, .flip_y = !renderer.Renderer.custom_shader_y_is_down };
++        switch (frame) {
++            .memory => |m| {
++                c.kind = 0;
++                c.width = m.width;
++                c.height = m.height;
++                c.pixels = m.pixels.ptr;
++                c.stride = @as(usize, m.width) * 4;
++                c.premultiplied = true;
++            },
++            .dmabuf => |d| {
++                c.kind = 1;
++                // The export pass already flipped it (top-down ARGB8888).
++                c.flip_y = false;
++                c.width = d.width;
++                c.height = d.height;
++                c.fourcc = d.fourcc;
++                c.modifier = d.modifier;
++                c.premultiplied = d.premultiplied;
++                c.n_planes = d.planes.count;
++                for (0..d.planes.count) |i| {
++                    c.fds[i] = d.planes.fds[i];
++                    c.offsets[i] = @intCast(d.planes.offsets[i]);
++                    c.strides[i] = @intCast(d.planes.strides[i]);
++                }
++            },
++        }
++        out.* = c;
++        return true;
++    }
++
++    /// Release a frame returned by ghostty_surface_take_frame. For DMA-BUF
++    /// frames this closes the file descriptors.
++    export fn ghostty_frame_free(handle: ?*anyopaque) void {
++        const ExportedFrame = renderer.Renderer.ExportedFrame;
++        if (comptime ExportedFrame == void) return;
++        const box: *ExportedFrame = @ptrCast(@alignCast(handle orelse return));
++        box.deinit();
++        std.heap.c_allocator.destroy(box);
++    }
++
++    /// ghostdrop: render on the GPU behind this DRM node (`/dev/dri/cardN` or
++    /// `/dev/dri/renderDN`), e.g. the one the display server scans out from,
++    /// so DMA-BUF frames can be presented without crossing GPUs. Call before
++    /// the first surface is created; no effect if the device isn't found.
++    export fn ghostty_set_render_device(path: ?[*:0]const u8) void {
++        @memset(&render_device_path, 0);
++        const p = std.mem.span(path orelse return);
++        if (p.len >= render_device_path.len) return;
++        @memcpy(render_device_path[0..p.len], p);
++        if (comptime @hasDecl(renderer.Device, "displayForDrmNode")) {
++            const gbm = @import("../renderer/opengl/gbm.zig");
++            gbm.render_node = render_device_path;
++        }
++    }
++
++    /// ghostdrop: DRM format modifiers the presenter can import for
++    /// ARGB8888 (X11: DRI3 GetSupportedModifiers; Wayland: linux-dmabuf
++    /// feedback). Export buffers are then allocated with GBM in one of these
++    /// layouts on the render device. Call before the first surface.
++    export fn ghostty_set_present_modifiers(mods: ?[*]const u64, count: usize) void {
++        if (comptime @hasDecl(renderer.Device, "displayForDrmNode")) {
++            const gbm = @import("../renderer/opengl/gbm.zig");
++            const n = @min(count, gbm.modifiers.len);
++            if (mods) |m| @memcpy(gbm.modifiers[0..n], m[0..n]);
++            gbm.modifier_count = if (mods == null) 0 else n;
++        }
++    }
++
++    /// Tell the renderer whether the embedder can present GPU (DMA-BUF)
++    /// frames. When false, the renderer hands out CPU frames instead.
++    export fn ghostty_surface_set_gpu_frames(surface: *Surface, enabled: bool) void {
++        surface.core_surface.reportPresentationHealth(if (enabled) .healthy else .unhealthy);
++    }
++
+     /// Create a new app.
+     export fn ghostty_app_new(
+         opts: *const apprt.runtime.App.Options,
+diff --git a/src/build/Config.zig b/src/build/Config.zig
+index 2415729..d7b5a88 100644
+--- a/src/build/Config.zig
++++ b/src/build/Config.zig
+@@ -67,6 +67,13 @@ emit_xcframework: bool = false,
+ emit_webdata: bool = false,
+ emit_unicode_table_gen: bool = false,
+ 
++/// Embed the Metal shader *source* and compile it at runtime instead of
++/// precompiling a metallib with `xcrun metal` (which needs full Xcode).
++metal_runtime_compile: bool = false,
++
++/// Install the static libghostty + header + resources for embedders.
++emit_embed_lib: bool = false,
++
+ /// Feature gates for libghostty-vt artifacts (-Dvt-features). The full
+ /// Ghostty application ignores this and always enables everything.
+ vt_features: TerminalBuildOptions.Features = .{},
+@@ -581,6 +588,18 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
+                 !config.emit_helpgen);
+     };
+ 
++    config.metal_runtime_compile = b.option(
++        bool,
++        "metal-runtime-compile",
++        "Compile Metal shaders at runtime (no Xcode Metal toolchain needed).",
++    ) orelse false;
++
++    config.emit_embed_lib = b.option(
++        bool,
++        "emit-embed-lib",
++        "Install libghostty.a, ghostty.h and resources for embedders (macOS without xcframework, Linux).",
++    ) orelse false;
++
+     config.emit_macos_app = b.option(
+         bool,
+         "emit-macos-app",
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 8f4e239..abd9a4d 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -500,11 +500,18 @@ pub fn add(
+     if (step.rootModuleTarget().os.tag.isDarwin()) {
+         try @import("apple_sdk").addPaths(b, step);
+ 
+-        const metallib = self.metallib.?;
+-        metallib.output.addStepDependencies(&step.step);
+-        step.root_module.addAnonymousImport("ghostty_metallib", .{
+-            .root_source_file = metallib.output,
+-        });
++        if (self.config.metal_runtime_compile) {
++            // Embed the shader source; shaders.zig compiles it at runtime.
++            step.root_module.addAnonymousImport("ghostty_metallib", .{
++                .root_source_file = b.path("src/renderer/shaders/shaders.metal"),
++            });
++        } else {
++            const metallib = self.metallib.?;
++            metallib.output.addStepDependencies(&step.step);
++            step.root_module.addAnonymousImport("ghostty_metallib", .{
++                .root_source_file = metallib.output,
++            });
++        }
+     }
+ 
+     // Other dependencies, mostly pure Zig
+@@ -653,6 +660,19 @@ pub fn add(
+         }
+     }
+ 
++    // Embedded libghostty on Linux: the OpenGL renderer needs glad + EGL,
++    // which the exe/GTK build otherwise provides.
++    if (step.kind == .lib and
++        self.config.app_runtime == .none and
++        step.rootModuleTarget().os.tag == .linux and
++        std.mem.eql(u8, step.name, "ghostty"))
++    {
++        step.root_module.addIncludePath(b.path("vendor/glad/include/"));
++        step.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c"), .flags = &.{} });
++        step.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/glad_egl.c"), .flags = &.{} });
++        step.root_module.linkSystemLibrary("egl", dynamic_link_opts);
++    }
++
+     // If we're building an exe then we have additional dependencies.
+     if (step.kind != .lib) {
+         // We always statically compile glad
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 581b0ce..80d15bd 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -82,6 +82,8 @@ pub fn init(
+             .view = switch (opts.rt_surface.platform) {
+                 .macos => |v| v.nsview,
+                 .ios => |v| v.uiview,
++                // ghostdrop: Linux embedding renders with OpenGL, never Metal.
++                .linux => return error.UnsupportedPlatform,
+             },
+         },
+ 
+diff --git a/src/renderer/OpenGL.zig b/src/renderer/OpenGL.zig
+index 0abf318..edfbe58 100644
+--- a/src/renderer/OpenGL.zig
++++ b/src/renderer/OpenGL.zig
+@@ -49,6 +49,10 @@ device: *const Device,
+ 
+ egl_context: *gl.egl.Context,
+ 
++/// ghostdrop: GPU pass that prepares embedded frames for direct
++/// presentation; created lazily on the render thread (see `present`).
++export_pass: ?ExportPass = null,
++
+ pub fn init(
+     alloc: Allocator,
+     device: *const Device,
+@@ -263,10 +267,11 @@ pub fn initShaders(
+ 
+ /// Initialize a new render target which can be presented by this API.
+ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
+-    _ = self;
+     return Target.init(.{
+         .width = width,
+         .height = height,
++        // ghostdrop: embedders present the export buffer directly.
++        .gbm_display = if (comptime apprt.runtime == apprt.embedded) self.device.display else null,
+     });
+ }
+ 
+@@ -282,7 +287,17 @@ pub fn present(
+     // We only export DMABUFs when the apprt can present them.
+     // Otherwise, use CPU buffers.
+     if (presentation_health == .healthy) {
+-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
++        // ghostdrop: embedders hand the buffer straight to the display
++        // server (X11 DRI3/Present, Wayland linux-dmabuf), which can't flip
++        // or swizzle like GTK's scene graph does: export top-down ARGB8888.
++        const pass: ?*const ExportPass = if (comptime apprt.runtime == apprt.embedded) pass: {
++            if (self.export_pass == null) self.export_pass = ExportPass.init() catch |err| {
++                log.warn("export pass unavailable err={}", .{err});
++                break :pass null;
++            };
++            break :pass &self.export_pass.?;
++        } else null;
++        if (target.exportDmabuf(self.device.display, self.egl_context, pass)) |dmabuf| {
+             return .{ .dmabuf = dmabuf };
+         } else |_| {
+             log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+@@ -297,6 +312,51 @@ pub fn present(
+     } };
+ }
+ 
++/// ghostdrop: for export textures without GBM storage, flips a rendered
++/// target vertically and swaps R/B, giving a top-down image in DRM ARGB8888
++/// byte order (B,G,R,A) that X11 (depth 24/32 pixmaps) and every Wayland
++/// compositor take as-is. (GBM-backed targets just blit; see Target.zig.)
++pub const ExportPass = struct {
++    program: gl.Program,
++    vao: gl.VertexArray,
++
++    const vs: [:0]const u8 =
++        \\#version 330 core
++        \\void main() {
++        \\  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++        \\  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++        \\}
++    ;
++    const fs: [:0]const u8 =
++        \\#version 330 core
++        \\uniform sampler2D src;
++        \\out vec4 color;
++        \\vec3 to_srgb(vec3 c) {
++        \\  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
++        \\}
++        \\void main() {
++        \\  ivec2 size = textureSize(src, 0);
++        \\  ivec2 p = ivec2(gl_FragCoord.xy);
++        \\  vec4 t = texelFetch(src, ivec2(p.x, size.y - 1 - p.y), 0);
++        \\  // texelFetch decodes the sRGB texture (drivers differ on honoring
++        \\  // EXT_texture_sRGB_decode for fetches), so encode it back.
++        \\  t.rgb = to_srgb(t.rgb);
++        \\  color = t.bgra;
++        \\}
++    ;
++
++    pub fn init() !ExportPass {
++        const program = try gl.Program.createVF(vs, fs);
++        errdefer program.destroy();
++        const vao = try gl.VertexArray.create();
++        const ctx = &gl.glad.context;
++        ctx.UseProgram.?(program.id);
++        ctx.Uniform1i.?(ctx.GetUniformLocation.?(program.id, "src"), 0);
++        ctx.UseProgram.?(0);
++        return .{ .program = program, .vao = vao };
++    }
++};
++
+ /// A finished frame exported for presentation by the apprt.
+ pub const ExportedFrame = union(enum) {
+     dmabuf: Dmabuf,
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index b14068f..9f47061 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -333,11 +333,63 @@ pub const BgImage = extern struct {
+ };
+ 
+ /// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
++/// The embedded shader blob. This is either a precompiled metallib
++/// (magic "MTLB") or, when built with -Dmetal-runtime-compile, the
++/// Metal shader source which we compile once per process at runtime.
++const embedded_shaders = @embedFile("ghostty_metallib");
++const embedded_is_metallib = std.mem.startsWith(u8, embedded_shaders, "MTLB");
++
++/// Process-wide cache for the runtime-compiled library so that only the
++/// first surface pays the compile cost. Keyed by device.
++var runtime_lib_mutex: std.atomic.Mutex = .unlocked;
++var runtime_lib_device: usize = 0;
++var runtime_lib: ?objc.Object = null;
++
+ fn initLibrary(device: objc.Object) !objc.Object {
++    if (comptime !embedded_is_metallib) return try initLibraryFromSource(device);
++    return try initLibraryFromMetallib(device);
++}
++
++fn initLibraryFromSource(device: objc.Object) !objc.Object {
++    while (!runtime_lib_mutex.tryLock()) std.atomic.spinLoopHint();
++    defer runtime_lib_mutex.unlock();
++
++    if (runtime_lib) |lib| {
++        if (runtime_lib_device == @intFromPtr(device.value)) {
++            // Caller owns a reference (it releases on deinit).
++            return lib.msgSend(objc.Object, objc.sel("retain"), .{});
++        }
++    }
++
++    const start: std.Io.Timestamp = .now(global.io(), .awake);
++    const source = try macos.foundation.String.createWithBytes(
++        embedded_shaders,
++        .utf8,
++        false,
++    );
++    defer source.release();
++
++    var err: ?*anyopaque = null;
++    const library = device.msgSend(
++        objc.Object,
++        objc.sel("newLibraryWithSource:options:error:"),
++        .{ source, @as(?*anyopaque, null), &err },
++    );
++    try checkError(err);
++
++    log.debug("shader library compiled from source time={}us", .{start.untilNow(global.io(), .awake).toMicroseconds()});
++
++    if (runtime_lib) |old| old.msgSend(void, objc.sel("release"), .{});
++    runtime_lib = library.msgSend(objc.Object, objc.sel("retain"), .{});
++    runtime_lib_device = @intFromPtr(device.value);
++    return library;
++}
++
++fn initLibraryFromMetallib(device: objc.Object) !objc.Object {
+     const start: std.Io.Timestamp = .now(global.io(), .awake);
+ 
+     const data = try macos.dispatch.Data.create(
+-        @embedFile("ghostty_metallib"),
++        embedded_shaders,
+         macos.dispatch.queue.getMain(),
+         macos.dispatch.Data.DESTRUCTOR_DEFAULT,
+     );
+diff --git a/src/renderer/opengl/Device.zig b/src/renderer/opengl/Device.zig
+index c3ad1b1..e9f566f 100644
+--- a/src/renderer/opengl/Device.zig
++++ b/src/renderer/opengl/Device.zig
+@@ -99,6 +99,55 @@ fn logUnsupportedPlatform() void {
+         "client extensions={s}", .{exts});
+ }
+ 
++// EGL_EXT_device_enumeration / EGL_EXT_device_query / EGL_EXT_device_drm(_render_node)
++// / EGL_EXT_platform_device. Not in our generated GLAD loader, so resolved
++// at runtime.
++const EGL_PLATFORM_DEVICE_EXT: egl.c.EGLenum = 0x313F;
++const EGL_DRM_DEVICE_FILE_EXT: egl.c.EGLint = 0x3233;
++const EGL_DRM_RENDER_NODE_FILE_EXT: egl.c.EGLint = 0x3377;
++const QueryDevicesFn = *const fn (egl.c.EGLint, ?[*]?*anyopaque, *egl.c.EGLint) callconv(.c) egl.c.EGLBoolean;
++const QueryDeviceStringFn = *const fn (?*anyopaque, egl.c.EGLint) callconv(.c) ?[*:0]const u8;
++
++/// ghostdrop: an EGL display on the GPU behind the DRM node `path`
++/// (`/dev/dri/cardN` or `/dev/dri/renderDN`), so frames can be handed to
++/// the display server on the GPU that scans them out. Multi-GPU systems
++/// otherwise render on whichever device the driver lists first.
++/// The display is never terminated (like the default display).
++pub fn displayForDrmNode(path: [:0]const u8) !*egl.Display {
++    try egl.load();
++    const query_devices: QueryDevicesFn = @ptrCast(egl.c.eglGetProcAddress("eglQueryDevicesEXT") orelse
++        return error.Unsupported);
++    const query_string: QueryDeviceStringFn = @ptrCast(egl.c.eglGetProcAddress("eglQueryDeviceStringEXT") orelse
++        return error.Unsupported);
++
++    const want = rdevOf(path.ptr) orelse return error.DeviceNotFound;
++
++    var devices: [16]?*anyopaque = @splat(null);
++    var count: egl.c.EGLint = 0;
++    if (query_devices(devices.len, &devices, &count) != egl.c.EGL_TRUE) return error.Unsupported;
++
++    for (devices[0..@intCast(count)]) |dev| {
++        for ([_]egl.c.EGLint{ EGL_DRM_RENDER_NODE_FILE_EXT, EGL_DRM_DEVICE_FILE_EXT }) |which| {
++            const node = query_string(dev, which) orelse continue;
++            const got = rdevOf(node) orelse continue;
++            if (got[0] != want[0] or got[1] != want[1]) continue;
++            log.info("rendering on EGL device {s} (requested {s})", .{ node, path });
++            return egl.Display.initPlatform(EGL_PLATFORM_DEVICE_EXT, @ptrCast(dev), null);
++        }
++    }
++    log.warn("no EGL device matches {s}; using the default device", .{path});
++    return error.DeviceNotFound;
++}
++
++/// Device number (major, minor) of a device node.
++fn rdevOf(path: [*:0]const u8) ?[2]u32 {
++    const linux = std.os.linux;
++    var sx: linux.Statx = undefined;
++    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &sx);
++    if (linux.errno(rc) != .SUCCESS) return null;
++    return .{ sx.rdev_major, sx.rdev_minor };
++}
++
+ pub fn deinit(self: *Device, alloc: std.mem.Allocator) void {
+     // Do not destroy the EGL display as it is externally managed.
+     alloc.destroy(self);
+diff --git a/src/renderer/opengl/Target.zig b/src/renderer/opengl/Target.zig
+index 70bf6b3..f6a0a2d 100644
+--- a/src/renderer/opengl/Target.zig
++++ b/src/renderer/opengl/Target.zig
+@@ -24,6 +24,8 @@ const Allocator = std.mem.Allocator;
+ const gl = @import("opengl");
+ const egl = gl.egl;
+ const Dmabuf = @import("../Dmabuf.zig");
++const OpenGL = @import("../OpenGL.zig");
++const gbm = @import("gbm.zig");
+ 
+ const log = std.log.scoped(.opengl);
+ 
+@@ -33,6 +35,9 @@ pub const Options = struct {
+     width: usize,
+     /// Desired height
+     height: usize,
++    /// ghostdrop: allocate the export texture with GBM (embedder-chosen
++    /// modifiers) on this display when set; see gbm.zig.
++    gbm_display: ?*egl.Display = null,
+ };
+ 
+ /// The framebuffer we render to.
+@@ -47,6 +52,11 @@ texture: gl.Texture,
+ export_texture: gl.Texture,
+ export_framebuffer: gl.Framebuffer,
+ 
++/// ghostdrop: GBM storage backing `export_texture` (see gbm.zig).
++gbm_buffer: ?gbm.Buffer = null,
++gbm_image: ?*egl.Image = null,
++gbm_display: ?*egl.Display = null,
++
+ /// Current width of this target.
+ width: usize,
+ /// Current height of this target.
+@@ -93,6 +103,12 @@ pub fn init(opts: Options) !Self {
+     // --- Export texture (plain RGBA8, for dma-buf export) ---
+     const export_texture = try gl.Texture.create();
+     errdefer export_texture.destroy();
++    var gbm_buffer: ?gbm.Buffer = null;
++    var gbm_image: ?*egl.Image = null;
++    errdefer if (gbm_buffer) |*b| {
++        if (gbm_image) |i| i.destroy(opts.gbm_display.?) catch {};
++        b.destroy();
++    };
+     {
+         const bound_tex = try export_texture.bind(.@"2d");
+         defer bound_tex.unbind();
+@@ -100,7 +116,13 @@ pub fn init(opts: Options) !Self {
+         try bound_tex.parameter(.mag_filter, .nearest);
+         try bound_tex.parameter(.wrap_s, .clamp_to_edge);
+         try bound_tex.parameter(.wrap_t, .clamp_to_edge);
+-        try bound_tex.image2D(
++        if (opts.gbm_display) |display| {
++            if (importGbm(display, @intCast(opts.width), @intCast(opts.height))) |r| {
++                gbm_buffer = r.buffer;
++                gbm_image = r.image;
++            }
++        }
++        if (gbm_buffer == null) try bound_tex.image2D(
+             0,
+             .rgba,
+             @intCast(opts.width),
+@@ -135,48 +157,118 @@ pub fn init(opts: Options) !Self {
+         .export_texture = export_texture,
+         .width = opts.width,
+         .height = opts.height,
++        .gbm_buffer = gbm_buffer,
++        .gbm_image = gbm_image,
++        .gbm_display = opts.gbm_display,
+     };
+ }
+ 
++const GbmImport = struct { buffer: gbm.Buffer, image: *egl.Image };
++
++/// Allocate a GBM buffer and make it the storage of the bound 2D texture.
++fn importGbm(display: *egl.Display, width: u32, height: u32) ?GbmImport {
++    var buffer = gbm.Buffer.create(width, height) orelse return null;
++    const c = egl.c;
++    // EGL_EXT_image_dma_buf_import(_modifiers) attribute names per plane:
++    // fd, offset, pitch, modifier lo, modifier hi.
++    const plane_attrs = [4][5]c.EGLAttrib{
++        .{ 0x3272, 0x3273, 0x3274, 0x3443, 0x3444 },
++        .{ 0x3275, 0x3276, 0x3277, 0x3445, 0x3446 },
++        .{ 0x3278, 0x3279, 0x327A, 0x3447, 0x3448 },
++        .{ 0x3440, 0x3441, 0x3442, 0x3449, 0x344A },
++    };
++    var attrs: [6 + 4 * 10 + 1]c.EGLAttrib = undefined;
++    var n: usize = 0;
++    for ([_]c.EGLAttrib{ c.EGL_WIDTH, width, c.EGL_HEIGHT, height, 0x3271, gbm.format_argb8888 }) |a| {
++        attrs[n] = a;
++        n += 1;
++    }
++    for (buffer.planes[0..buffer.plane_count], 0..) |p, i| {
++        const vals = [5]c.EGLAttrib{
++            p.fd,
++            p.offset,
++            p.stride,
++            @intCast(buffer.modifier & 0xffffffff),
++            @intCast(buffer.modifier >> 32),
++        };
++        for (plane_attrs[i], vals) |k, v| {
++            attrs[n] = k;
++            attrs[n + 1] = v;
++            n += 2;
++        }
++    }
++    attrs[n] = c.EGL_NONE;
++    // EGL_LINUX_DMA_BUF_EXT
++    const raw = c.eglCreateImage(display, c.EGL_NO_CONTEXT, 0x3270, null, &attrs) orelse {
++        log.warn("eglCreateImage(dma-buf, modifier={x}) failed", .{buffer.modifier});
++        buffer.destroy();
++        return null;
++    };
++    const image: *egl.Image = @ptrCast(raw);
++    const TargetTexture = *const fn (gl.c.GLenum, ?*anyopaque) callconv(.c) void;
++    const proc = c.eglGetProcAddress("glEGLImageTargetTexture2DOES") orelse {
++        image.destroy(display) catch {};
++        buffer.destroy();
++        return null;
++    };
++    const target_texture: TargetTexture = @ptrCast(proc);
++    target_texture(gl.c.GL_TEXTURE_2D, raw);
++    gl.errors.getError() catch {
++        log.warn("glEGLImageTargetTexture2DOES failed", .{});
++        image.destroy(display) catch {};
++        buffer.destroy();
++        return null;
++    };
++    return .{ .buffer = buffer, .image = image };
++}
++
+ pub fn deinit(self: *Self) void {
+     self.framebuffer.destroy();
+     self.texture.destroy();
+     self.export_framebuffer.destroy();
+     self.export_texture.destroy();
++    if (self.gbm_buffer) |*b| {
++        if (self.gbm_image) |i| i.destroy(self.gbm_display.?) catch {};
++        b.destroy();
++    }
+ }
+ 
+ pub fn exportDmabuf(
+     self: *const Self,
+     display: *egl.Display,
+     context: *egl.Context,
++    /// ghostdrop: when set, export top-down ARGB8888 (see OpenGL.ExportPass).
++    pass: ?*const OpenGL.ExportPass,
+ ) !Dmabuf {
+-    // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise
+-    // the values may be linearized as they're copied, but even though
+-    // the draw framebuffer has a linear internal format, the values in
+-    // it should be sRGB, not linear!
+-    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+-    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+-        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
+-    };
+-
+-    const read_bind = try self.framebuffer.bind(.read);
+-    defer read_bind.unbind();
+-
+-    const draw_bind = try self.export_framebuffer.bind(.draw);
+-    defer draw_bind.unbind();
+-
+-    try gl.blitFramebuffer(
+-        0,
+-        0,
+-        @intCast(self.width),
+-        @intCast(self.height),
+-        0,
+-        0,
+-        @intCast(self.width),
+-        @intCast(self.height),
+-        .{ .color_buffer_bit = true },
+-        .nearest,
+-    );
++    if (pass != null and self.gbm_buffer != null) {
++        // GBM-backed: the driver maps ARGB8888 channels, so a raw blit with
++        // the rows reversed is all it takes (sRGB bytes copied verbatim).
++        try self.blitToExport(true);
++        // Consumers in other processes get no implicit sync on NVIDIA.
++        gl.finish();
++        if (self.gbm_buffer) |b| {
++            var planes: Dmabuf.Planes = .{ .count = @intCast(b.plane_count) };
++            for (b.planes[0..b.plane_count], 0..) |pl, i| {
++                planes.fds[i] = std.c.dup(pl.fd);
++                planes.strides[i] = @intCast(pl.stride);
++                planes.offsets[i] = @intCast(pl.offset);
++            }
++            try planes.validate();
++            return .{
++                .width = @intCast(self.width),
++                .height = @intCast(self.height),
++                .fourcc = gbm.format_argb8888,
++                .modifier = b.modifier,
++                .premultiplied = true,
++                .planes = planes,
++            };
++        }
++    }
++    if (pass) |p| {
++        try self.runExportPass(p);
++    } else {
++        try self.blitToExport(false);
++    }
+ 
+     const image: *egl.Image = try .create(
+         display,
+@@ -207,13 +299,104 @@ pub fn exportDmabuf(
+         .height = @intCast(self.height),
+         // bitCast instead of intCast since the numerical value of fourccs
+         // is rather meaningless, and we only care about the bit pattern
+-        .fourcc = @bitCast(query.fourcc),
++        .fourcc = if (pass != null) DRM_FORMAT_ARGB8888 else @bitCast(query.fourcc),
+         .modifier = query.modifier,
+         .premultiplied = true,
+         .planes = planes,
+     };
+ }
+ 
++const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'AR24'
++
++/// Copy the render texture into the export texture verbatim, optionally
++/// with the rows reversed (top-down for direct presentation).
++fn blitToExport(self: *const Self, flip: bool) !void {
++    // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise
++    // the values may be linearized as they're copied, but even though
++    // the draw framebuffer has a linear internal format, the values in
++    // it should be sRGB, not linear!
++    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
++    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
++        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
++    };
++
++    const read_bind = try self.framebuffer.bind(.read);
++    defer read_bind.unbind();
++
++    const draw_bind = try self.export_framebuffer.bind(.draw);
++    defer draw_bind.unbind();
++
++    const w: c_int = @intCast(self.width);
++    const h: c_int = @intCast(self.height);
++    try gl.blitFramebuffer(
++        0,
++        0,
++        w,
++        h,
++        0,
++        if (flip) h else 0,
++        w,
++        if (flip) 0 else h,
++        .{ .color_buffer_bit = true },
++        .nearest,
++    );
++}
++
++/// ghostdrop: draw the render texture into the (plain RGBA8) export texture
++/// flipped vertically with R/B swapped, so its bytes are top-down ARGB8888,
++/// then wait for the GPU: consumers in other processes (X server,
++/// compositor) get no implicit sync on NVIDIA.
++fn runExportPass(self: *const Self, p: *const OpenGL.ExportPass) !void {
++    const ctx = &gl.glad.context;
++    const c = gl.c;
++
++    // Save what we touch; the renderer doesn't expect us in between.
++    var prev_program: c.GLint = 0;
++    var prev_vao: c.GLint = 0;
++    var prev_fbo: c.GLint = 0;
++    var prev_active: c.GLint = 0;
++    var prev_tex: c.GLint = 0;
++    var prev_viewport: [4]c.GLint = @splat(0);
++    ctx.GetIntegerv.?(c.GL_CURRENT_PROGRAM, &prev_program);
++    ctx.GetIntegerv.?(c.GL_VERTEX_ARRAY_BINDING, &prev_vao);
++    ctx.GetIntegerv.?(c.GL_DRAW_FRAMEBUFFER_BINDING, &prev_fbo);
++    ctx.GetIntegerv.?(c.GL_ACTIVE_TEXTURE, &prev_active);
++    ctx.ActiveTexture.?(c.GL_TEXTURE0);
++    ctx.GetIntegerv.?(c.GL_TEXTURE_BINDING_2D, &prev_tex);
++    // A bound sampler object's sRGB-decode state would override ours.
++    var prev_sampler: c.GLint = 0;
++    ctx.GetIntegerv.?(c.GL_SAMPLER_BINDING, &prev_sampler);
++    ctx.GetIntegerv.?(c.GL_VIEWPORT, &prev_viewport);
++    const blend = ctx.IsEnabled.?(c.GL_BLEND) == c.GL_TRUE;
++    const scissor = ctx.IsEnabled.?(c.GL_SCISSOR_TEST) == c.GL_TRUE;
++    const srgb = ctx.IsEnabled.?(c.GL_FRAMEBUFFER_SRGB) == c.GL_TRUE;
++    defer {
++        if (blend) ctx.Enable.?(c.GL_BLEND);
++        if (scissor) ctx.Enable.?(c.GL_SCISSOR_TEST);
++        if (srgb) ctx.Enable.?(c.GL_FRAMEBUFFER_SRGB);
++        ctx.Viewport.?(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
++        ctx.BindTexture.?(c.GL_TEXTURE_2D, @intCast(prev_tex));
++        ctx.BindSampler.?(0, @intCast(prev_sampler));
++        ctx.ActiveTexture.?(@intCast(prev_active));
++        ctx.BindFramebuffer.?(c.GL_DRAW_FRAMEBUFFER, @intCast(prev_fbo));
++        ctx.BindVertexArray.?(@intCast(prev_vao));
++        ctx.UseProgram.?(@intCast(prev_program));
++    }
++
++    ctx.Disable.?(c.GL_BLEND);
++    ctx.Disable.?(c.GL_SCISSOR_TEST);
++    ctx.Disable.?(c.GL_FRAMEBUFFER_SRGB);
++    ctx.BindFramebuffer.?(c.GL_DRAW_FRAMEBUFFER, self.export_framebuffer.id);
++    ctx.Viewport.?(0, 0, @intCast(self.width), @intCast(self.height));
++    ctx.BindTexture.?(c.GL_TEXTURE_2D, self.texture.id);
++    ctx.BindSampler.?(0, 0);
++    ctx.UseProgram.?(p.program.id);
++    ctx.BindVertexArray.?(p.vao.id);
++    ctx.DrawArrays.?(c.GL_TRIANGLES, 0, 3);
++    ctx.Finish.?();
++    try gl.errors.getError();
++}
++
+ /// Read the current contents of the framebuffer into CPU memory.
+ ///
+ /// This is used by the CPU readback presentation fallback. The
+@@ -228,12 +411,15 @@ pub fn readPixelsAlloc(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
+     const pixels = try alloc.alloc(u8, self.width * self.height * 4);
+     errdefer alloc.free(pixels);
+ 
++    // Embedders (app runtime "none") get BGRA: it's the native byte order of
++    // Wayland ARGB8888 / X11 32-bit visuals, so presenting needs no swizzle.
++    const format: gl.Texture.Format = if (comptime @import("../../build_config.zig").app_runtime == .none) .bgra else .rgba;
+     try gl.readPixels(
+         0,
+         0,
+         @intCast(self.width),
+         @intCast(self.height),
+-        .rgba,
++        format,
+         .unsigned_byte,
+         pixels.ptr,
+     );
+diff --git a/src/renderer/opengl/gbm.zig b/src/renderer/opengl/gbm.zig
+new file mode 100644
+index 0000000..c722171
+--- /dev/null
++++ b/src/renderer/opengl/gbm.zig
+@@ -0,0 +1,122 @@
++//! ghostdrop: allocate export buffers with GBM in a layout the presenting
++//! side (X server via DRI3, or a Wayland compositor) can import.
++//!
++//! A plain GL texture gets whatever layout the driver likes best; NVIDIA,
++//! for one, picks compressed block-linear kinds that its X server refuses to
++//! import. GBM lets us pick from the consumer's modifier list instead. libgbm
++//! is loaded at runtime so it stays an optional dependency.
++const std = @import("std");
++
++const log = std.log.scoped(.opengl_gbm);
++
++/// DRM_FORMAT_ARGB8888 ('AR24').
++pub const format_argb8888: u32 = 0x34325241;
++
++/// Set by the embedder before surfaces exist (see embedded.zig).
++pub var render_node: [256:0]u8 = @splat(0);
++pub var modifiers: [64]u64 = undefined;
++pub var modifier_count: usize = 0;
++
++const Device = opaque {};
++pub const Bo = opaque {};
++
++const Api = struct {
++    create_device: *const fn (c_int) callconv(.c) ?*Device,
++    bo_create_with_modifiers: *const fn (?*Device, u32, u32, u32, [*]const u64, c_uint) callconv(.c) ?*Bo,
++    bo_destroy: *const fn (*Bo) callconv(.c) void,
++    bo_get_plane_count: *const fn (*Bo) callconv(.c) c_int,
++    bo_get_fd_for_plane: *const fn (*Bo, c_int) callconv(.c) c_int,
++    bo_get_stride_for_plane: *const fn (*Bo, c_int) callconv(.c) u32,
++    bo_get_offset: *const fn (*Bo, c_int) callconv(.c) u32,
++    bo_get_modifier: *const fn (*Bo) callconv(.c) u64,
++};
++
++var api: Api = undefined;
++var device: ?*Device = null;
++/// 0 = not tried, 1 = in progress, 2 = ready, 3 = unavailable.
++var state: std.atomic.Value(u8) = .init(0);
++
++/// The GBM device on `render_node`, or null if GBM isn't usable/configured.
++fn getDevice() ?*Device {
++    while (true) {
++        switch (state.load(.acquire)) {
++            2 => return device,
++            3 => return null,
++            1 => std.Thread.yield() catch {},
++            else => if (state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
++                const ok = init();
++                state.store(if (ok) 2 else 3, .release);
++                return if (ok) device else null;
++            },
++        }
++    }
++}
++
++fn init() bool {
++    const len = std.mem.indexOfScalar(u8, &render_node, 0) orelse 0;
++    if (len == 0 or modifier_count == 0) return false;
++    const lib = std.c.dlopen("libgbm.so.1", .{ .NOW = true }) orelse {
++        log.warn("libgbm.so.1 not found; export buffers use the driver's layout", .{});
++        return false;
++    };
++    inline for (@typeInfo(Api).@"struct".field_names) |name| {
++        const sym = std.c.dlsym(lib, "gbm_" ++ name) orelse {
++            log.warn("libgbm lacks gbm_{s}", .{name});
++            return false;
++        };
++        @field(api, name) = @ptrCast(@alignCast(sym));
++    }
++    const fd = std.c.open(render_node[0..len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true });
++    if (fd < 0) {
++        log.warn("cannot open {s} for GBM", .{render_node[0..len]});
++        return false;
++    }
++    device = api.create_device(fd) orelse {
++        log.warn("gbm_create_device failed on {s}", .{render_node[0..len]});
++        _ = std.c.close(fd);
++        return false;
++    };
++    log.info("GBM export buffers on {s} ({} modifiers)", .{ render_node[0..len], modifier_count });
++    return true;
++}
++
++pub const Plane = struct { fd: c_int, stride: u32, offset: u32 };
++
++/// An ARGB8888 buffer with one of the configured modifiers.
++pub const Buffer = struct {
++    bo: *Bo,
++    modifier: u64,
++    planes: [4]Plane,
++    plane_count: usize,
++
++    /// Allocate; null if GBM is unavailable or allocation fails.
++    pub fn create(width: u32, height: u32) ?Buffer {
++        const dev = getDevice() orelse return null;
++        // GBM_BO_USE_RENDERING; modifiers come from the consumer.
++        const bo = api.bo_create_with_modifiers(dev, width, height, format_argb8888, &modifiers, @intCast(modifier_count)) orelse {
++            log.warn("gbm_bo_create_with_modifiers {}x{} failed", .{ width, height });
++            return null;
++        };
++        const n: usize = @intCast(@max(1, @min(4, api.bo_get_plane_count(bo))));
++        var b: Buffer = .{ .bo = bo, .modifier = api.bo_get_modifier(bo), .planes = undefined, .plane_count = n };
++        for (0..n) |i| {
++            const fd = api.bo_get_fd_for_plane(bo, @intCast(i));
++            if (fd < 0) {
++                for (b.planes[0..i]) |p| _ = std.c.close(p.fd);
++                api.bo_destroy(bo);
++                return null;
++            }
++            b.planes[i] = .{
++                .fd = fd,
++                .stride = api.bo_get_stride_for_plane(bo, @intCast(i)),
++                .offset = api.bo_get_offset(bo, @intCast(i)),
++            };
++        }
++        return b;
++    }
++
++    pub fn destroy(self: *Buffer) void {
++        for (self.planes[0..self.plane_count]) |p| _ = std.c.close(p.fd);
++        api.bo_destroy(self.bo);
++    }
++};

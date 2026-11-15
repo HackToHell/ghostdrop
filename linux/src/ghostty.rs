@@ -55,6 +55,18 @@ pub enum GEvent {
 static QUEUE: Mutex<Vec<GEvent>> = Mutex::new(Vec::new());
 static WAKER: OnceLock<calloop::ping::Ping> = OnceLock::new();
 
+/// Render on the GPU behind this DRM node (before the first surface exists).
+pub fn set_render_device(path: &str) {
+    if let Ok(c) = CString::new(path) {
+        unsafe { ghostty_set_render_device(c.as_ptr()) };
+    }
+}
+
+/// DRM modifiers the presenter imports (export buffers are allocated in one).
+pub fn set_present_modifiers(mods: &[u64]) {
+    unsafe { ghostty_set_present_modifiers(mods.as_ptr(), mods.len()) };
+}
+
 pub fn set_waker(p: calloop::ping::Ping) {
     let _ = WAKER.set(p);
 }

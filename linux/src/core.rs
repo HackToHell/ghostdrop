@@ -98,6 +98,9 @@ impl Placement {
     }
 }
 
+/// x, y, width, height in physical pixels.
+pub type Rect = (u32, u32, u32, u32);
+
 /// What the core needs from a window-system backend.
 pub trait Window {
     fn show(&mut self, p: &Placement);
@@ -116,6 +119,15 @@ pub trait Window {
     fn read_clipboard(&mut self, clip: Clip, token: u64);
     fn backend_name(&self) -> &'static str;
     fn hotkey_status(&self) -> String;
+    /// Only a new GPU (DMA-BUF) frame for the terminal area: backends that
+    /// present those directly skip recomposing the window.
+    fn request_present(&mut self) {
+        self.request_redraw();
+    }
+    /// Debug: write what the window shows to a PPM file.
+    fn snapshot(&mut self, _path: &str) -> Result<(), String> {
+        Err("snapshot is not supported by this backend".into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +214,12 @@ pub struct Core {
     notice_pending: bool,
     /// Pending malloc_trim after tabs were closed.
     trim_at: Option<Instant>,
+    /// The backend presents DMA-BUF frames directly (zero copy).
+    gpu_backend: bool,
+    /// CPU frames in a row while GPU frames were wanted (export failing).
+    gpu_misses: u32,
+    /// When keyboard focus was last lost (see `toggle`).
+    focus_lost_at: Option<Instant>,
     pub quit: bool,
     pub last_error: Option<String>,
 }
@@ -257,6 +275,9 @@ impl Core {
             shown_at: None,
             notice_pending,
             trim_at: None,
+            gpu_backend: false,
+            gpu_misses: 0,
+            focus_lost_at: None,
             quit: false,
             last_error: None,
         }
@@ -303,7 +324,7 @@ impl Core {
         self.term_rect_at(w.size(), w.scale())
     }
 
-    fn term_rect_at(&self, (ww, wh): (u32, u32), scale: f64) -> (u32, u32, u32, u32) {
+    pub fn term_rect_at(&self, (ww, wh): (u32, u32), scale: f64) -> (u32, u32, u32, u32) {
         let bh = self.bar_height(scale).min(wh);
         let y = if self.settings.tab_bar_top { bh } else { 0 };
         (0, y, ww, wh - bh)
@@ -485,6 +506,10 @@ impl Core {
         }
         let p = self.placement();
         w.show(&p);
+        if !w.is_visible() {
+            trace!("show refused by the backend");
+            return;
+        }
         if std::mem::take(&mut self.notice_pending) {
             self.config_notice(w);
         }
@@ -512,7 +537,11 @@ impl Core {
 
     pub fn toggle(&mut self, w: &mut dyn Window) {
         if w.is_visible() {
-            if w.is_focused() {
+            // Window managers running a key binding (e.g. i3's `exec
+            // ghostdrop`) refocus their own window right as the toggle
+            // arrives; a focus loss that recent still counts as focused.
+            let just_lost = self.focus_lost_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300));
+            if w.is_focused() || just_lost {
                 self.hide(w);
             } else {
                 w.focus();
@@ -525,6 +554,7 @@ impl Core {
     /// Backend reports keyboard focus changes.
     pub fn focus_changed(&mut self, w: &mut dyn Window, focused: bool) {
         trace!("focus_changed {focused} visible={}", w.is_visible());
+        self.focus_lost_at = (!focused).then(Instant::now);
         self.rt.set_focus(focused);
         let sel = self.selected;
         if let Some(t) = self.tabs.get_mut(sel) {
@@ -543,6 +573,34 @@ impl Core {
             }
         }
         w.request_redraw();
+    }
+
+    /// Backends report whether they can present DMA-BUF frames directly.
+    pub fn set_gpu_backend(&mut self, on: bool) {
+        if self.gpu_backend != on {
+            trace!("gpu presentation {}", if on { "on" } else { "off" });
+        }
+        self.gpu_backend = on;
+        self.sync_gpu();
+    }
+
+    /// GPU frames when the backend can present them and nothing is drawn on
+    /// top of the terminal (prompts and the search box need CPU composition).
+    fn sync_gpu(&mut self) {
+        let want = self.gpu_backend && self.prompt.is_none() && self.search.is_none();
+        for t in &self.tabs {
+            t.set_gpu(want);
+        }
+    }
+
+    /// The selected tab's frame if it is a DMA-BUF to present directly, with
+    /// the terminal rectangle (physical px) for a window of `size`/`scale`.
+    pub fn gpu_frame(&self, size: (u32, u32), scale: f64) -> Option<(&Frame, Rect)> {
+        if !self.gpu_backend || self.prompt.is_some() || self.search.is_some() {
+            return None;
+        }
+        let f = self.tabs.get(self.selected)?.frame.as_ref().filter(|f| f.dmabuf().is_some())?;
+        Some((f, self.term_rect_at(size, scale)))
     }
 
     /// The user clicked outside the dropdown (backends detect this their own way).
@@ -752,9 +810,25 @@ impl Core {
             GEvent::Render(id) => {
                 if let Some(i) = self.tab_index(id) {
                     if let Some(f) = Frame::take(self.tabs[i].surface) {
+                        let gpu = f.dmabuf().is_some();
+                        // GPU frames wanted but CPU frames keep coming: the
+                        // driver can't export (e.g. software rendering).
+                        let wanted = self.gpu_backend && self.prompt.is_none() && self.search.is_none();
+                        self.gpu_misses = if wanted && !gpu { self.gpu_misses + 1 } else { 0 };
+                        if self.gpu_misses >= 8 {
+                            eprintln!("ghostdrop: GPU frames unavailable (DMA-BUF export failed); using CPU frames");
+                            self.gpu_misses = 0;
+                            self.set_gpu_backend(false);
+                        }
+                        let was_gpu = self.tabs[i].frame.as_ref().is_some_and(|p| p.dmabuf().is_some());
                         self.tabs[i].frame = Some(f);
                         if i == self.selected && w.is_visible() {
-                            w.request_redraw();
+                            // Same kind as before: just the terminal area changed.
+                            if gpu && was_gpu {
+                                w.request_present();
+                            } else {
+                                w.request_redraw();
+                            }
                         }
                     }
                 }
@@ -1273,6 +1347,7 @@ impl Core {
 
     /// Compose a full frame. `size`/`scale` describe the window being drawn.
     pub fn draw(&mut self, size: (u32, u32), scale64: f64, c: &mut Canvas) {
+        self.sync_gpu();
         let t0 = Instant::now();
         self.draw_inner(size, scale64, c);
         if let Some(at) = self.shown_at.take() {
@@ -1489,6 +1564,15 @@ impl Core {
         match cmd {
             "dump" => self.dump(w),
             "mem" => crate::mem_report(arg.as_deref() == Some("trim")),
+            "prompt-answer" => {
+                self.prompt_answer(w, arg.as_deref() == Some("yes"));
+                w.request_redraw();
+                "ok".into()
+            }
+            "snapshot" => match w.snapshot(arg.as_deref().unwrap_or("/tmp/ghostdrop-snapshot.ppm")) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("error: {e}"),
+            },
             "binding" => {
                 let ok = self.selected_tab().is_some_and(|t| t.binding_action(&arg.unwrap_or_default()));
                 format!("{ok}")
@@ -1532,14 +1616,20 @@ impl Core {
                     rows,
                     t.focused,
                     t.process_exited(),
-                    t.frame.as_ref().map_or("none".into(), |f| format!("{}x{}", f.width, f.height))
+                    t.frame.as_ref().map_or("none".into(), |f| format!(
+                        "{}x{}{}",
+                        f.width,
+                        f.height,
+                        if f.dmabuf().is_some() { " dmabuf" } else { "" }
+                    ))
                 )
             })
             .collect();
         let (ww, wh) = w.size();
         format!(
-            "{{\"backend\":\"{}\",\"visible\":{},\"focused\":{},\"size\":[{},{}],\"scale\":{},\"selected\":{},\"tabBar\":{},\"hotkey\":\"{}\",\"prompt\":\"{}\",\"search\":\"{}\",\"errors\":[{}],\"tabs\":[{}],\"screen\":\"{}\"}}",
+            "{{\"backend\":\"{}\",\"gpu\":{},\"visible\":{},\"focused\":{},\"size\":[{},{}],\"scale\":{},\"selected\":{},\"tabBar\":{},\"hotkey\":\"{}\",\"prompt\":\"{}\",\"search\":\"{}\",\"errors\":[{}],\"tabs\":[{}],\"screen\":\"{}\"}}",
             w.backend_name(),
+            self.gpu_backend,
             w.is_visible(),
             w.is_focused(),
             ww,

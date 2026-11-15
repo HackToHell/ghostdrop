@@ -58,6 +58,13 @@ dev/vm/vm.sh drive x11 < dev/vm/tests/ui-x11.txt   # screenshot tour → /tmp/gd
 and graphics, DECRQM 2026, OSC 52, focus reports); run it in a tab, press
 `shift+enter`, `ctrl+i`, `esc`, and read `/tmp/probe.json`.
 
+Testing on a real desktop someone is using (e.g. a GPU box for zero-copy):
+`GHOSTDROP_X11_OFFSCREEN=1` keeps the X11 window offscreen (Composite redirect),
+click-through and focus-less, and `ghostdrop ctl snapshot out.ppm` (with
+`control-commands = true`) reads back what it shows, including DRI3/Present frames.
+For Wayland, run a private headless sway (`WLR_BACKENDS=headless`, its own
+`XDG_RUNTIME_DIR`) and capture it with `cargo run --release --example wlshot -- out.ppm`.
+
 Gotchas when driving the desktops:
 
 * Each `vm.sh drive` is a new VNC client whose pointer starts at (0,0): `move`

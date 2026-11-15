@@ -119,18 +119,21 @@ git clone --recurse-submodules https://github.com/HackToHell/ghostdrop && cd gho
 scripts/build-linux.sh install   # Zig 0.17.1 is fetched if needed; installs to ~/.local
 ```
 
-Wayland has no global key grabs, so the compositor runs `ghostdrop` on the hotkey
-(running it toggles the drop-down, starting it if needed):
+On X11 Ghostdrop grabs `hotkey` itself, so i3 only needs to start it. Wayland has
+no global key grabs, so there the compositor runs `ghostdrop` on the hotkey (running
+it toggles the drop-down, starting it if needed):
 
 ```
-# sway                                   # i3 (or let Ghostdrop grab `hotkey` itself)
-exec ghostdrop --daemon                  exec --no-startup-id ghostdrop --daemon
-bindsym ctrl+grave exec ghostdrop        bindsym ctrl+grave exec --no-startup-id ghostdrop
-
+# i3 (X11)                               # sway
+exec --no-startup-id ghostdrop --daemon  exec ghostdrop --daemon
+                                         bindsym ctrl+grave exec ghostdrop
 # Hyprland
 exec-once = ghostdrop --daemon
 bind = CTRL, grave, exec, ghostdrop
 ```
+
+(An i3 `bindsym … exec ghostdrop` works too, but i3 refocuses its own window after
+every binding, so the built-in grab is both faster and steadier.)
 
 What's different from macOS:
 
@@ -142,14 +145,30 @@ What's different from macOS:
   sized per monitor, with fractional scaling (`wp_fractional_scale_v1`; `Xft.dpi` on
   X11); clicking another window hides it (`quick-terminal-autohide`);
 * config errors are shown in the drop-down and by `ghostdrop ctl reload`;
-* not yet: IME (text-input-v3 / XIM), slide animation, drag-to-resize, zero-copy
-  DMA-BUF presentation (libghostty renders on the GPU and frames are copied into a
-  shared-memory buffer).
+* not yet: IME (text-input-v3 / XIM), slide animation, drag-to-resize.
 
-Measured in an Arch Linux ARM VM with **software** OpenGL (llvmpipe, no GPU):
-show → first frame **0.6–3 ms**, hotkey round-trip 3–4 ms, 65–75 MiB/s of `cat`,
-0 % CPU while hidden. `dev/vm/` has that VM (Apple `container`, i3 and sway
-desktops over VNC) and `dev/vm/tests/suite.sh` runs the end-to-end tests in it.
+**Zero-copy presentation.** libghostty renders on the GPU and frames go straight to
+the display server as DMA-BUFs, with no readback or copy: X11 via DRI3
+`PixmapFromBuffers` + `PresentPixmap`, Wayland via `zwp_linux_dmabuf_v1` on a
+subsurface. Export buffers are allocated with GBM in a layout the display server
+lists as importable (NVIDIA's X server rejects the compressed layouts GL picks on its
+own), and libghostty renders on the GPU that drives the display on multi-GPU
+machines. Only the tab bar and prompts are drawn on the CPU. Without DRI3/dmabuf
+support or DMA-BUF export (software rendering) it falls back to CPU frames by
+itself; `GHOSTDROP_GPU=0` forces that.
+
+Measured on an RTX 3070 (NVIDIA 610, Xorg + i3, 3840×1080 drop-down):
+
+| | CPU frames | zero-copy |
+|---|---|---|
+| show → first frame | 1.2–1.6 ms | **0.1–0.2 ms** |
+| `cat` 39 MiB (ghostdrop / Xorg CPU) | 111 MiB/s (890 / 210 ms) | 114 MiB/s (820 / **0** ms) |
+| idle, cursor blinking (5 s, ghostdrop + Xorg) | 250 ms | **30 ms** |
+
+In an Arch Linux ARM VM with software OpenGL (llvmpipe, no GPU, CPU frames): show →
+first frame 0.6–3 ms, hotkey round-trip 3–4 ms, 65–75 MiB/s, 0 % CPU while hidden.
+`dev/vm/` has that VM (Apple `container`, i3 and sway desktops over VNC) and
+`dev/vm/tests/suite.sh` runs the end-to-end tests in it.
 
 ## Set up with AI
 
@@ -274,8 +293,9 @@ patches/ghostty/        patches applied to vendor/ghostty before building
 scripts/build-libghostty.sh
 linux/src/              the Linux app (Rust)
   core.rs               backend-independent logic: tabs, placement, prompts, search, IPC commands
-  wayland.rs            wlr-layer-shell surface, input, clipboard, fractional scale
-  x11.rs                override-redirect window, MIT-SHM, XKB, hotkey grab, XInput2
+  wayland.rs            wlr-layer-shell surface, input, clipboard, fractional scale, dmabuf subsurface
+  x11.rs                override-redirect window, MIT-SHM, DRI3/Present, XKB, hotkey grab, XInput2
+  drm.rs                render node of a DRM device (for picking libghostty's GPU)
   ghostty.rs / tab.rs   libghostty runtime, config layering, one surface per tab
   settings.rs, keys.rs, xkb.rs, draw.rs, ipc.rs
 scripts/build-linux.sh  builds libghostty (shared) + the Linux app, `install` to ~/.local

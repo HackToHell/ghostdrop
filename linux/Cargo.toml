@@ -15,7 +15,7 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 xkbcommon = { version = "0.9", features = ["wayland", "x11"] }
-x11rb = { version = "0.14", features = ["allow-unsafe-code", "shm", "xkb", "xinput", "randr", "dl-libxcb", "cursor", "resource_manager"] }
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "shm", "xkb", "xinput", "randr", "dri3", "present", "composite", "xfixes", "shape", "dl-libxcb", "cursor", "resource_manager"] }
 fontdue = "0.9"
 memmap2 = "0.9"
 rustix = { version = "1", features = ["fs", "shm", "pipe", "event", "net", "process", "time"] }

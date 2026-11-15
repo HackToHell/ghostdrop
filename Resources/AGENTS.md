@@ -43,12 +43,17 @@ Everything in this guide applies, except (check `uname` first):
 - **Start/autostart**: from the window manager config, e.g. sway/i3
   `exec ghostdrop --daemon`. Running `ghostdrop` with no arguments toggles the
   drop-down, starting it first if needed.
-- **Hotkey**: Wayland has no global key grabs, so bind the key **in the compositor**
+- **Hotkey**: on X11 Ghostdrop grabs `hotkey` itself (preferred; the WM only needs
+  `exec --no-startup-id ghostdrop --daemon`). If another program already owns that
+  key (e.g. tilda or guake on `` ctrl+` ``), pick a different `hotkey`; the daemon
+  prints "hotkey … is taken by another client" to stderr when that happens.
+  Wayland has no global key grabs, so bind the key **in the compositor**
   to run `ghostdrop`: sway `bindsym ctrl+grave exec ghostdrop`, Hyprland
-  `bind = CTRL, grave, exec, ghostdrop`. On X11 Ghostdrop grabs `hotkey` itself; if
-  the window manager already uses that key, bind it there instead (i3:
-  `bindsym ctrl+grave exec --no-startup-id ghostdrop`). Edit the WM config only with
-  the user's OK, then reload the WM (`swaymsg reload`, `i3-msg reload`).
+  `bind = CTRL, grave, exec, ghostdrop`. Edit the WM config only with the user's OK,
+  then reload the WM (`swaymsg reload`, `i3-msg reload`).
+- **Rendering**: zero-copy GPU presentation is automatic (falls back to CPU frames
+  where unsupported); `GHOSTDROP_GPU=0` in the daemon's environment forces CPU frames
+  if a driver misbehaves.
 - **Tab shortcuts**: Ghostty's Linux defaults: `ctrl+shift+t` new tab, `ctrl+shift+w`
   close, `ctrl+page_up/down` or `ctrl+tab` switch, `alt+1…9` go to tab,
   `ctrl+shift+c/v` copy/paste, `ctrl+shift+f` search, `ctrl+shift+,` reload config.

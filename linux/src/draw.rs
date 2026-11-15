@@ -64,14 +64,17 @@ impl<'a> Canvas<'a> {
     pub fn blit_frame(&mut self, frame: Option<&Frame>, x: usize, y: usize, w: usize, h: usize, bg: Rgb) {
         let w = w.min(self.width.saturating_sub(x));
         let h = h.min(self.height.saturating_sub(y));
+        // GPU (DMA-BUF) frames are presented by the backend over the area
+        // they cover, which is never uploaded from here: leave it alone and
+        // only fill what the frame doesn't cover.
         let (fw, fh) = frame.map_or((0, 0), |f| (f.width as usize, f.height as usize));
         let cw = fw.min(w);
         let ch = fh.min(h);
-        if let Some(f) = frame {
+        if let Some(f) = frame.filter(|f| f.dmabuf().is_none()) {
             for row in 0..ch {
-                let src = &f.row(row as u32)[..cw * 4];
+                let Some(src) = f.row(row as u32) else { break };
                 let o = (y + row) * self.stride + x * 4;
-                self.buf[o..o + cw * 4].copy_from_slice(src);
+                self.buf[o..o + cw * 4].copy_from_slice(&src[..cw * 4]);
             }
         }
         if cw < w {
