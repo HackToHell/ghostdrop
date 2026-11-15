@@ -1,0 +1,46 @@
+# Arch Linux ARM development machine for Ghostdrop's Linux port.
+#
+# Runs as an Apple `container machine` (macOS 26+): a persistent lightweight VM
+# that boots systemd from this image. It provides two real desktops over VNC:
+#   :5901  X11  + i3     (TigerVNC Xvnc)
+#   :5902  Wayland + sway (sway + wayvnc)
+# GPU-less: OpenGL/EGL via Mesa llvmpipe (software), which is also what the
+# Ghostty renderer's EGL "surfaceless" platform uses here.
+FROM docker.io/menci/archlinuxarm:latest
+
+ENV container=container
+
+RUN pacman-key --init && pacman-key --populate archlinuxarm && \
+    pacman -Syu --noconfirm --needed \
+      base-devel git openssh sudo dbus systemd iproute2 iputils curl wget rsync \
+      vim less man-db htop jq python unzip \
+      rust cmake pkgconf clang lld \
+      mesa mesa-utils libglvnd \
+      wayland wayland-protocols libxkbcommon libxkbcommon-x11 \
+      libx11 libxcb xcb-util xcb-util-wm xcb-util-keysyms libxrandr libxi libxcursor \
+      fontconfig freetype2 harfbuzz oniguruma \
+      sway swaybg foot wayvnc wl-clipboard grim wtype wlr-randr \
+      i3-wm i3status dmenu xterm tigervnc \
+      xorg-xprop xorg-xwininfo xorg-xrandr xorg-xdpyinfo xclip xdotool xorg-xwd imagemagick \
+      ttf-dejavu noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd && \
+    pacman -Scc --noconfirm
+
+# systemd inside a container machine: skip units that need real hardware/consoles.
+RUN systemctl mask \
+      dev-hugepages.mount sys-fs-fuse-connections.mount \
+      systemd-firstboot.service console-getty.service getty@tty1.service && \
+    systemctl enable sshd.service && \
+    : > /etc/machine-id
+
+RUN sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+
+# Zig, pinned to the version Ghostty 1.4 requires.
+RUN curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.1/zig-aarch64-linux-0.17.1.tar.xz && \
+    echo "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795  /tmp/zig.tar.xz" | sha256sum -c - && \
+    mkdir -p /opt/zig && tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && \
+    ln -sf /opt/zig/zig /usr/local/bin/zig && rm /tmp/zig.tar.xz
+
+COPY provision.sh /usr/local/sbin/ghostdrop-provision
+COPY sessions/ /usr/local/bin/
+RUN chmod +x /usr/local/sbin/ghostdrop-provision /usr/local/bin/ghostdrop-*-session

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Wayland + sway desktop served over VNC (wayvnc) on port 5902.
+# sway runs on wlroots' headless backend (virtual output, no GPU/DRM needed);
+# wayvnc (started from the sway config) exports that output over VNC.
+set -u
+export HOME="${HOME:-/home/$(id -un)}"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=sway
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+export LIBGL_ALWAYS_SOFTWARE=1
+
+exec dbus-run-session -- sway

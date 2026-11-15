@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# X11 + i3 desktop served over VNC on :1 (port 5901).
+set -u
+export HOME="${HOME:-/home/$(id -un)}"
+export DISPLAY=:1 XDG_SESSION_TYPE=x11
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export LIBGL_ALWAYS_SOFTWARE=1
+
+Xvnc :1 -geometry 1600x1000 -depth 24 -rfbport 5901 -localhost=0 \
+  -SecurityTypes VncAuth -PasswordFile "$HOME/.config/tigervnc/passwd" \
+  -AlwaysShared -AcceptSetDesktopSize &
+xpid=$!
+for _ in $(seq 100); do [ -S /tmp/.X11-unix/X1 ] && break; sleep 0.1; done
+
+dbus-run-session -- i3
+kill "$xpid" 2>/dev/null
+wait "$xpid" 2>/dev/null
