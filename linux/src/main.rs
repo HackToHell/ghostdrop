@@ -2,9 +2,15 @@
 //!
 //!   ghostdrop              toggle (starts it if not running, then shows it)
 //!   ghostdrop --daemon     start hidden (for autostart)
-//!   ghostdrop ctl <cmd>    toggle|show|hide|new-tab [profile]|next-tab|previous-tab|reload|quit
+//!   ghostdrop ctl <cmd>    toggle|show|hide|new-tab [profile]|next-tab|previous-tab|reload|quit [force]
 //!   ghostdrop check        validate the config
 //!   ghostdrop +<action>    run a Ghostty CLI action (+list-themes, +show-config --docs, ...)
+// bindgen emits c_uint or c_int enum constants depending on platform/version,
+// so casts that are no-ops here are needed elsewhere.
+#![allow(clippy::unnecessary_cast)]
+// x11.rs uses an immediately-invoked closure as a try-block.
+#![allow(clippy::redundant_closure_call, clippy::too_many_arguments)]
+
 mod core;
 mod draw;
 mod ffi;
@@ -54,7 +60,7 @@ fn setup_env() {
         if let Some(dir) = exe.parent() {
             for cand in [dir.join("share/ghostty"), dir.join("../share/ghostdrop/ghostty")] {
                 if cand.join("themes").is_dir() {
-                    std::env::set_var("GHOSTTY_RESOURCES_DIR", cand);
+                    std::env::set_var("GHOSTTY_RESOURCES_DIR", std::fs::canonicalize(&cand).unwrap_or(cand));
                     return;
                 }
             }
@@ -66,21 +72,27 @@ fn setup_env() {
 fn link_setup_guide() {
     let Ok(exe) = std::fs::canonicalize("/proc/self/exe") else { return };
     let Some(dir) = exe.parent() else { return };
-    let guide = [dir.join("AGENTS.md"), dir.join("../share/doc/ghostdrop/AGENTS.md")].into_iter().find(|p| p.exists());
+    let guide = [dir.join("AGENTS.md"), dir.join("../share/doc/ghostdrop/AGENTS.md")]
+        .into_iter()
+        .find_map(|p| std::fs::canonicalize(p).ok());
     let Some(guide) = guide else { return };
     let Some(cfg_dir) = settings::Settings::path().parent().map(|p| p.to_path_buf()) else { return };
-    let link = cfg_dir.join("AGENTS.md");
-    match std::fs::symlink_metadata(&link) {
-        Ok(m) if !m.file_type().is_symlink() => return,
-        Ok(_) => {
-            if std::fs::read_link(&link).ok().as_deref() == Some(guide.as_path()) {
-                return;
+    let _ = std::fs::create_dir_all(&cfg_dir);
+    // Same names as the macOS app: agents look for either.
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let link = cfg_dir.join(name);
+        match std::fs::symlink_metadata(&link) {
+            Ok(m) if !m.file_type().is_symlink() => continue, // the user's own file
+            Ok(_) => {
+                if std::fs::read_link(&link).ok().as_deref() == Some(guide.as_path()) {
+                    continue;
+                }
+                let _ = std::fs::remove_file(&link);
             }
-            let _ = std::fs::remove_file(&link);
+            Err(_) => {}
         }
-        Err(_) => {}
+        let _ = std::os::unix::fs::symlink(&guide, &link);
     }
-    let _ = std::os::unix::fs::symlink(&guide, &link);
 }
 
 fn check() -> i32 {
@@ -125,7 +137,7 @@ fn main() {
         Some("ctl") => {
             let cmd = args[2..].join(" ");
             if cmd.is_empty() {
-                eprintln!("usage: ghostdrop ctl toggle|show|hide|new-tab [profile]|next-tab|previous-tab|reload|quit");
+                eprintln!("usage: ghostdrop ctl toggle|show|hide|new-tab [profile]|next-tab|previous-tab|reload|quit [force]");
                 std::process::exit(2);
             }
             match ipc::send(&cmd) {
@@ -203,4 +215,29 @@ fn main() {
         ipc::cleanup();
         std::process::exit(1);
     }
+}
+
+/// glibc heap statistics (debug): in-use vs free-but-retained bytes, and RSS
+/// before/after optionally returning free memory to the OS.
+pub fn mem_report(trim: bool) -> String {
+    fn rss_mib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
+            .unwrap_or(0)
+            / 1024
+    }
+    let before = rss_mib();
+    let mi = unsafe { libc::mallinfo2() };
+    let mut out = format!(
+        "rss={before}MiB malloc_in_use={}MiB malloc_free={}MiB mmapped={}MiB",
+        mi.uordblks >> 20,
+        mi.fordblks >> 20,
+        mi.hblkhd >> 20
+    );
+    if trim {
+        unsafe { libc::malloc_trim(0) };
+        out += &format!(" rss_after_trim={}MiB", rss_mib());
+    }
+    out
 }

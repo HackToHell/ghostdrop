@@ -10,6 +10,7 @@ script lines:
   move X Y              move the pointer
   click N               click mouse button N (1 left, 2 middle, 3 right, 4/5 wheel)
   down N / up N         press / release mouse button N
+  keydown K / keyup K   hold / release a key (for auto-repeat)
   capture /path.png     screenshot
   # comment
 """
@@ -48,6 +49,10 @@ def main():
                 client.mouseDown(int(arg))
             elif cmd == "up":
                 client.mouseUp(int(arg))
+            elif cmd == "keydown":
+                client.keyDown(arg)
+            elif cmd == "keyup":
+                client.keyUp(arg)
             elif cmd == "capture":
                 client.refreshScreen()
                 client.captureScreen(arg)

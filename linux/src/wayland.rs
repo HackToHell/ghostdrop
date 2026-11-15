@@ -35,7 +35,7 @@ use smithay_client_toolkit::{
 };
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{
@@ -47,6 +47,11 @@ use wayland_client::{
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, wp_fractional_scale_v1,
+    wp_fractional_scale_v1::WpFractionalScaleV1,
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 use xkbcommon::xkb;
 
 const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
@@ -83,6 +88,16 @@ pub struct WlWin {
     kb_focus: bool,
     logical: (u32, u32),
     scale: i32,
+    /// Mapping is waiting for the output-size probe (see `show`).
+    probe: Option<Placement>,
+    /// Logical size of the output the compositor put this surface on.
+    known_output: Option<(f64, f64)>,
+    /// wp_fractional_scale_v1 preferred scale (x120); 0 = not in use.
+    scale120: u32,
+    frac_mgr: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
+    frac: Option<WpFractionalScaleV1>,
+    viewport: Option<WpViewport>,
     frame_pending: bool,
     needs_redraw: bool,
     serial: u32,
@@ -90,6 +105,17 @@ pub struct WlWin {
     /// Mapped with exclusive keyboard interactivity to get focus right away;
     /// relaxed to on-demand once focus arrives (so clicking away works).
     relax_keyboard: bool,
+    /// When we last switched Exclusive -> OnDemand.
+    relaxed_at: Option<Instant>,
+    /// The compositor drops focus from on-demand layer surfaces (sway 1.12
+    /// does so on every layer re-arrange), so stay exclusive.
+    ondemand_broken: bool,
+    /// Keyboard interactivity currently committed.
+    exclusive_now: std::cell::Cell<bool>,
+    /// Last keyboard leave (for focus-flicker detection).
+    kb_left_at: Option<Instant>,
+    pointer_inside: bool,
+    pointer_left_at: Option<Instant>,
 }
 
 pub struct WlState {
@@ -110,17 +136,40 @@ fn layer_kind(p: &Placement) -> Layer {
 }
 
 impl WlWin {
-    fn physical(&self) -> (u32, u32) {
-        (self.logical.0 * self.scale as u32, self.logical.1 * self.scale as u32)
+    /// Fractional scaling is active (exact device pixels via a viewport).
+    fn fractional(&self) -> bool {
+        self.scale120 > 0 && self.viewport.is_some()
     }
 
-    /// Logical size of the output we'll most likely appear on.
-    fn output_size(&self) -> Option<(f64, f64)> {
+    fn scale_f(&self) -> f64 {
+        if self.fractional() {
+            self.scale120 as f64 / 120.0
+        } else {
+            self.scale as f64
+        }
+    }
+
+    fn physical(&self) -> (u32, u32) {
+        if self.fractional() {
+            // Per wp_fractional_scale_v1: buffer = logical * scale, rounded half away from zero.
+            let s = self.scale_f();
+            ((self.logical.0 as f64 * s).round() as u32, (self.logical.1 as f64 * s).round() as u32)
+        } else {
+            (self.logical.0 * self.scale as u32, self.logical.1 * self.scale as u32)
+        }
+    }
+
+    fn output_sizes(&self) -> Vec<(f64, f64)> {
         self.output_state
             .outputs()
             .filter_map(|o| self.output_state.info(&o))
             .filter_map(|i| i.logical_size.map(|(w, h)| (w as f64, h as f64)))
-            .next()
+            .collect()
+    }
+
+    /// Logical size of the output we're on (or will most likely appear on).
+    fn output_size(&self) -> Option<(f64, f64)> {
+        self.known_output.or_else(|| self.output_sizes().first().copied())
     }
 
     fn configure_layer(&self, layer: &LayerSurface, p: &Placement) {
@@ -139,7 +188,9 @@ impl WlWin {
         layer.set_size(size.0.round() as u32, size.1.round() as u32);
         layer.set_exclusive_zone(0);
         // Exclusive until we have focus (see `relax_keyboard`).
-        layer.set_keyboard_interactivity(if p.exclusive_keyboard || !self.kb_focus {
+        let exclusive = p.exclusive_keyboard || self.ondemand_broken || !self.kb_focus;
+        self.exclusive_now.set(exclusive);
+        layer.set_keyboard_interactivity(if exclusive {
             KeyboardInteractivity::Exclusive
         } else {
             KeyboardInteractivity::OnDemand
@@ -166,11 +217,30 @@ impl Window for WlWin {
             return;
         }
         let surface = self.compositor.create_surface(&self.qh);
+        if let (Some(m), Some(v)) = (self.frac_mgr.as_ref(), self.viewporter.as_ref()) {
+            self.frac = Some(m.get_fractional_scale(&surface, &self.qh, FracData));
+            self.viewport = Some(v.get_viewport(&surface, &self.qh, NoEvents));
+        }
         let layer = self.layer_shell.create_layer_surface(&self.qh, surface, layer_kind(p), Some("ghostdrop"), None);
-        self.configure_layer(&layer, p);
+        self.known_output = None;
+        let sizes = self.output_sizes();
+        if !p.fullscreen && sizes.windows(2).any(|w| w[0] != w[1]) {
+            // Outputs differ and layer-shell won't say which one we'll get.
+            // Ask for the whole output first; the configure reveals its size,
+            // then size for real before the first buffer (one round trip).
+            self.configure_layer(&layer, p);
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            layer.set_size(0, 0);
+            layer.set_exclusive_zone(-1);
+            self.probe = Some(*p);
+        } else {
+            self.configure_layer(&layer, p);
+        }
         layer.commit();
         self.layer = Some(layer);
-        self.relax_keyboard = !p.exclusive_keyboard;
+        self.relax_keyboard = !p.exclusive_keyboard && !self.ondemand_broken;
+        self.relaxed_at = None;
+        self.kb_left_at = None;
         self.visible = true;
         self.configured = false;
         self.frame_pending = false;
@@ -178,11 +248,23 @@ impl Window for WlWin {
 
     fn hide(&mut self) {
         self.stop_repeat();
+        if let Some(f) = self.frac.take() {
+            f.destroy();
+        }
+        if let Some(v) = self.viewport.take() {
+            v.destroy();
+        }
         self.layer = None;
         self.visible = false;
         self.configured = false;
         self.kb_focus = false;
         self.frame_pending = false;
+        self.pointer_inside = false;
+        self.relax_keyboard = false;
+        self.relaxed_at = None;
+        self.kb_left_at = None;
+        self.probe = None;
+        self.known_output = None;
     }
 
     fn is_visible(&self) -> bool {
@@ -194,7 +276,7 @@ impl Window for WlWin {
     }
 
     fn scale(&self) -> f64 {
-        self.scale as f64
+        self.scale_f()
     }
 
     fn size(&self) -> (u32, u32) {
@@ -230,6 +312,15 @@ impl Window for WlWin {
     }
 
     fn set_clipboard(&mut self, clip: Clip, text: String) {
+        crate::core::trace!(
+            "set_clipboard {clip:?} ({} bytes) ddm={} dev={} psm={} pdev={} serial={}",
+            text.len(),
+            self.ddm.is_some(),
+            self.data_device.is_some(),
+            self.psm.is_some(),
+            self.primary_device.is_some(),
+            self.serial
+        );
         match clip {
             Clip::Standard => {
                 let (Some(ddm), Some(dev)) = (self.ddm.as_ref(), self.data_device.as_ref()) else { return };
@@ -330,6 +421,7 @@ impl WlState {
         }
         let Some(layer) = w.layer.as_ref() else { return };
         let (pw, ph) = w.physical();
+        let scale = w.scale_f();
         if pw == 0 || ph == 0 {
             return;
         }
@@ -341,9 +433,15 @@ impl WlState {
         let Some(pool) = w.pool.as_mut() else { return };
         let Ok((buffer, canvas)) = pool.create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888) else { return };
         let mut c = Canvas { buf: canvas, width: pw as usize, height: ph as usize, stride: stride as usize };
-        self.core.draw((pw, ph), w.scale as f64, &mut c);
+        self.core.draw((pw, ph), scale, &mut c);
         let surface = layer.wl_surface();
-        surface.set_buffer_scale(w.scale);
+        match w.viewport.as_ref().filter(|_| w.fractional()) {
+            Some(vp) => {
+                surface.set_buffer_scale(1);
+                vp.set_destination(w.logical.0 as i32, w.logical.1 as i32);
+            }
+            None => surface.set_buffer_scale(w.scale),
+        }
         surface.damage_buffer(0, 0, pw as i32, ph as i32);
         surface.frame(&w.qh, smithay_client_toolkit::compositor::FrameCallbackData(surface.clone()));
         if buffer.attach_to(surface).is_ok() {
@@ -425,11 +523,24 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         kb_focus: false,
         logical: (0, 0),
         scale: 1,
+        scale120: 0,
+        probe: None,
+        known_output: None,
+        frac_mgr: globals.bind::<WpFractionalScaleManagerV1, WlState, NoEvents>(&qh, 1..=1, NoEvents).ok(),
+        viewporter: globals.bind::<WpViewporter, WlState, NoEvents>(&qh, 1..=1, NoEvents).ok(),
+        frac: None,
+        viewport: None,
         frame_pending: false,
         needs_redraw: false,
         serial: 0,
         clip_results: Vec::new(),
         relax_keyboard: false,
+        relaxed_at: None,
+        ondemand_broken: false,
+        exclusive_now: std::cell::Cell::new(false),
+        kb_left_at: None,
+        pointer_inside: false,
+        pointer_left_at: None,
     };
     let mut st = WlState { win, core: core_builder() };
     // Let outputs/seats arrive before sizing anything.
@@ -439,7 +550,14 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         st.core.show(&mut st.win);
     }
     while !st.core.quit {
-        event_loop.dispatch(Some(Duration::from_millis(500)), &mut st).map_err(|e| e.to_string())?;
+        let timeout = st
+            .core
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(Duration::from_millis(500))
+            .min(Duration::from_millis(500));
+        event_loop.dispatch(Some(timeout), &mut st).map_err(|e| format!("Wayland connection lost ({e}); exiting"))?;
+        st.core.poll_timers(&mut st.win);
         st.after_dispatch();
         let _ = st.win.conn.flush();
     }
@@ -481,6 +599,17 @@ impl LayerShellHandler for WlState {
 
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
         let (w, h) = cfg.new_size;
+        if let Some(p) = self.win.probe.take() {
+            crate::core::trace!("output probe: {w}x{h}");
+            if w > 0 && h > 0 {
+                self.win.known_output = Some((w as f64, h as f64));
+            }
+            if let Some(layer) = self.win.layer.as_ref() {
+                self.win.configure_layer(layer, &p);
+                layer.commit();
+            }
+            return;
+        }
         let size = (w.max(1), h.max(1));
         let first = !self.win.configured;
         let changed = size != self.win.logical;
@@ -499,19 +628,12 @@ impl SeatHandler for WlState {
     }
 
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
-        if self.win.data_device.is_none() {
-            if let Some(ddm) = self.win.ddm.as_ref() {
-                self.win.data_device = Some(ddm.get_data_device(qh, &seat));
-            }
-        }
-        if self.win.primary_device.is_none() {
-            if let Some(psm) = self.win.psm.as_ref() {
-                self.win.primary_device = Some(psm.get_selection_device(qh, &seat));
-            }
-        }
+        self.ensure_data_devices(qh, &seat);
     }
 
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        // Seats that existed at startup don't get new_seat; set clipboard up here too.
+        self.ensure_data_devices(qh, &seat);
         if cap == Capability::Keyboard && self.win.keyboard.is_none() {
             self.win.keyboard = Some(seat.get_keyboard(qh, KbData));
         }
@@ -535,6 +657,21 @@ impl SeatHandler for WlState {
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl WlState {
+    fn ensure_data_devices(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        if self.win.data_device.is_none() {
+            if let Some(ddm) = self.win.ddm.as_ref() {
+                self.win.data_device = Some(ddm.get_data_device(qh, seat));
+            }
+        }
+        if self.win.primary_device.is_none() {
+            if let Some(psm) = self.win.psm.as_ref() {
+                self.win.primary_device = Some(psm.get_selection_device(qh, seat));
+            }
+        }
+    }
 }
 
 impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
@@ -561,9 +698,21 @@ impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
                     if let Some(l) = st.win.layer.as_ref() {
                         l.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
                         l.commit();
+                        st.win.exclusive_now.set(false);
+                        st.win.relaxed_at = Some(Instant::now());
                     }
                 }
+                // With an exclusive layer, sway answers a click on another
+                // window with leave+enter in the same instant. A flicker while
+                // the pointer is outside us (and didn't just leave, which is
+                // focus-follows-mouse on hover) means "clicked elsewhere".
+                let flicker = st.win.kb_left_at.take().is_some_and(|t| t.elapsed() < Duration::from_millis(40));
+                let outside = !st.win.pointer_inside
+                    && st.win.pointer_left_at.is_none_or(|t| t.elapsed() > Duration::from_millis(150));
                 st.core.focus_changed(&mut st.win, true);
+                if flicker && outside && st.win.exclusive_now.get() && st.win.visible {
+                    st.core.outside_click(&mut st.win);
+                }
             }
             wl_keyboard::Event::Leave { serial, .. } => {
                 if std::env::var_os("GHOSTDROP_TRACE_KEYS").is_some() {
@@ -571,7 +720,21 @@ impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
                 }
                 st.win.serial = serial;
                 st.win.kb_focus = false;
+                st.win.kb_left_at = Some(Instant::now());
                 st.win.stop_repeat();
+                if st.win.relaxed_at.take().is_some_and(|t| t.elapsed() < Duration::from_millis(150)) {
+                    // Focus vanished right after going on-demand: this
+                    // compositor won't keep it. Go back to exclusive for good;
+                    // the focus-loss debounce hides the bounce.
+                    crate::core::trace!("compositor drops on-demand focus; staying exclusive");
+                    st.win.ondemand_broken = true;
+                    st.win.kb_left_at = None;
+                    if let Some(l) = st.win.layer.as_ref() {
+                        l.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+                        l.commit();
+                        st.win.exclusive_now.set(true);
+                    }
+                }
                 if let Some(x) = st.win.xkb.as_mut() {
                     x.reset_compose();
                 }
@@ -635,9 +798,14 @@ impl PointerHandler for WlState {
             match e.kind {
                 PointerEventKind::Enter { serial } => {
                     self.win.serial = serial;
+                    self.win.pointer_inside = true;
                     self.core.pointer(&mut self.win, PointerInput::Motion { x, y }, mods);
                 }
-                PointerEventKind::Leave { .. } => self.core.pointer(&mut self.win, PointerInput::Leave, mods),
+                PointerEventKind::Leave { .. } => {
+                    self.win.pointer_inside = false;
+                    self.win.pointer_left_at = Some(Instant::now());
+                    self.core.pointer(&mut self.win, PointerInput::Leave, mods)
+                }
                 PointerEventKind::Motion { .. } => self.core.pointer(&mut self.win, PointerInput::Motion { x, y }, mods),
                 PointerEventKind::Press { button, serial, .. } | PointerEventKind::Release { button, serial, .. } => {
                     self.win.serial = serial;
@@ -747,6 +915,31 @@ impl PrimarySelectionSourceHandler for WlState {
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &ZwpPrimarySelectionSourceV1) {
         if self.win.primary_source.as_ref().is_some_and(|s| s.inner() == source) {
             self.win.primary_source = None;
+        }
+    }
+}
+
+/// User data for protocol objects that send no events.
+struct NoEvents;
+impl Dispatch2<WpFractionalScaleManagerV1, WlState> for NoEvents {
+    fn event(&self, _: &mut WlState, _: &WpFractionalScaleManagerV1, _: <WpFractionalScaleManagerV1 as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<WlState>) {}
+}
+impl Dispatch2<WpViewporter, WlState> for NoEvents {
+    fn event(&self, _: &mut WlState, _: &WpViewporter, _: <WpViewporter as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<WlState>) {}
+}
+impl Dispatch2<WpViewport, WlState> for NoEvents {
+    fn event(&self, _: &mut WlState, _: &WpViewport, _: <WpViewport as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<WlState>) {}
+}
+
+struct FracData;
+impl Dispatch2<WpFractionalScaleV1, WlState> for FracData {
+    fn event(&self, st: &mut WlState, _: &WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, _: &Connection, _: &QueueHandle<WlState>) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            if scale != st.win.scale120 && scale > 0 {
+                crate::core::trace!("fractional scale {}", scale as f64 / 120.0);
+                st.win.scale120 = scale;
+                st.core.resized(&mut st.win);
+            }
         }
     }
 }

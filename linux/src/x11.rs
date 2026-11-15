@@ -12,6 +12,7 @@ use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xkb::{self as xxkb, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::{randr, shm, Event};
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::xcb_ffi::XCBConnection;
@@ -398,6 +399,7 @@ impl Window for X11Win {
             Pos::Center => (cx, cy),
         };
         let resized = (w, h) != (self.geom.2, self.geom.3);
+        crate::core::trace!("x11 show: monitor {mx},{my} {mw}x{mh} -> {x},{y} {w}x{h} (resized={resized})");
         self.geom = (x, y, w, h);
         let _ = self.conn.configure_window(
             self.win,
@@ -522,6 +524,15 @@ impl X11State {
     fn handle_event(&mut self, ev: Event) {
         let w = &mut self.win;
         match ev {
+            Event::XinputRawButtonPress(e) => {
+                if w.visible && (1..=3).contains(&e.detail) {
+                    let child = w.conn.query_pointer(w.root).ok().and_then(|c| c.reply().ok()).map(|p| p.child);
+                    crate::core::trace!("raw button {} child={child:?} ours={}", e.detail, w.win);
+                    if child.is_some_and(|c| c != w.win) {
+                        self.core.outside_click(&mut self.win);
+                    }
+                }
+            }
             Event::KeyPress(e) if e.event == w.root => {
                 if w.hotkey.is_some_and(|(kc, _)| kc == e.detail) {
                     self.core.toggle(&mut self.win);
@@ -617,9 +628,26 @@ impl X11State {
         }
     }
 
+    /// Drain X events. A dead connection ends the daemon instead of spinning
+    /// on a forever-readable fd.
+    fn pump_events(&mut self) {
+        loop {
+            match self.win.conn.poll_for_event() {
+                Ok(Some(ev)) => self.handle_event(ev),
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("ghostdrop: X11 connection lost ({e}); exiting");
+                    self.core.quit = true;
+                    break;
+                }
+            }
+        }
+    }
+
     fn after_dispatch(&mut self) {
-        while let Ok(Some(ev)) = self.win.conn.poll_for_event() {
-            self.handle_event(ev);
+        self.pump_events();
+        if self.core.quit {
+            return;
         }
         let results = std::mem::take(&mut self.win.clip_results);
         for (t, text) in results {
@@ -670,6 +698,17 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
         xxkb::MapPart::default(),
         &xxkb::SelectEventsAux::new(),
     );
+
+    // Raw button presses anywhere (XInput2) to autohide on click-outside:
+    // WMs like i3 don't move X focus away from an override-redirect window
+    // when you click the window they already consider focused.
+    let xi2 = conn.xinput_xi_query_version(2, 2).ok().and_then(|c| c.reply().ok()).is_some_and(|r| r.major_version >= 2);
+    if xi2 {
+        let _ = conn.xinput_xi_select_events(
+            root,
+            &[xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask: vec![xinput::XIEventMask::RAW_BUTTON_PRESS] }],
+        );
+    }
 
     // Scale from Xft.dpi (what GTK/Qt use on X11).
     let db = x11rb::resource_manager::new_from_default(&conn).ok();
@@ -795,9 +834,7 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
     let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|e| e.to_string())?;
     handle
         .insert_source(Generic::new(fd, Interest::READ, Mode::Level), |_, _, st: &mut X11State| {
-            while let Ok(Some(ev)) = st.win.conn.poll_for_event() {
-                st.handle_event(ev);
-            }
+            st.pump_events();
             Ok(PostAction::Continue)
         })
         .map_err(|e| e.to_string())?;
@@ -819,7 +856,14 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
         st.core.show(&mut st.win);
     }
     while !st.core.quit {
-        event_loop.dispatch(Some(Duration::from_millis(500)), &mut st).map_err(|e| e.to_string())?;
+        let timeout = st
+            .core
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(Duration::from_millis(500))
+            .min(Duration::from_millis(500));
+        event_loop.dispatch(Some(timeout), &mut st).map_err(|e| e.to_string())?;
+        st.core.poll_timers(&mut st.win);
         st.after_dispatch();
     }
     st.core.tabs.clear();

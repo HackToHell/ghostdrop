@@ -24,7 +24,7 @@ RUN sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && \
       sway swaybg foot wayvnc xorg-xwayland wl-clipboard grim wtype wlr-randr \
       i3-wm i3status dmenu xterm tigervnc \
       xorg-xprop xorg-xwininfo xorg-xrandr xorg-xdpyinfo xclip xdotool xorg-xwd imagemagick \
-      ttf-dejavu noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd && \
+      ttf-dejavu noto-fonts noto-fonts-emoji wqy-zenhei ttf-jetbrains-mono-nerd && \
     pacman -Scc --noconfirm
 
 # systemd inside a container machine: skip units that need real hardware/consoles.

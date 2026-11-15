@@ -290,6 +290,19 @@ index 8f4e239..abd9a4d 100644
      // If we're building an exe then we have additional dependencies.
      if (step.kind != .lib) {
          // We always statically compile glad
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 581b0ce..80d15bd 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -82,6 +82,8 @@ pub fn init(
+             .view = switch (opts.rt_surface.platform) {
+                 .macos => |v| v.nsview,
+                 .ios => |v| v.uiview,
++                // ghostdrop: Linux embedding renders with OpenGL, never Metal.
++                .linux => return error.UnsupportedPlatform,
+             },
+         },
+ 
 diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
 index b14068f..9f47061 100644
 --- a/src/renderer/metal/shaders.zig

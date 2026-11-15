@@ -1,0 +1,47 @@
+# X11: window at y=0, tab bar (28px) appears with 2+ tabs
+sleep 1
+type seq 1 300
+key enter
+sleep 0.8
+move 600 300
+click 4
+click 4
+click 4
+click 4
+click 4
+sleep 0.6
+capture /tmp/gd-test/ui-1-scrolled.png
+key ctrl-shift-T
+sleep 1.2
+move 1584 14
+click 1
+sleep 1.2
+capture /tmp/gd-test/ui-2-three-tabs.png
+move 200 14
+click 1
+sleep 0.6
+move 1300 14
+click 2
+sleep 0.8
+capture /tmp/gd-test/ui-3-closed-third.png
+move 400 300
+type sleep 100
+key enter
+sleep 0.5
+key ctrl-shift-W
+sleep 0.8
+capture /tmp/gd-test/ui-4-prompt.png
+key esc
+sleep 0.5
+key ctrl-shift-F
+sleep 0.5
+type seq
+sleep 1
+capture /tmp/gd-test/ui-5-search.png
+key esc
+sleep 0.4
+key ctrl-shift-W
+sleep 0.6
+key enter
+sleep 0.8
+capture /tmp/gd-test/ui-6-after-close.png

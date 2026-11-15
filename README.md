@@ -1,6 +1,7 @@
 # Ghostdrop
 
-A fast, native **drop-down (Quake-style) terminal for macOS** built on
+A fast, native **drop-down (Quake-style) terminal for macOS** — and
+[**Linux**](#linux) (Wayland and X11) — built on
 [libghostty](https://github.com/ghostty-org/ghostty) — Ghostty's terminal core,
 renderer and font stack — with **real tabs** and **global hotkeys**.
 
@@ -103,6 +104,52 @@ The disk image contains `Ghostdrop.app`, an `Applications` shortcut to drag it o
 and **`Set Up with AI.md`**. If someone launches the app straight from the disk image,
 Ghostdrop offers to move itself to Applications. Ad-hoc builds (no Developer ID) need
 *System Settings → Privacy & Security → Open Anyway* on other Macs.
+
+## Linux
+
+The same app for Linux: **Wayland** compositors with wlr-layer-shell (sway,
+Hyprland, river, niri, …) and **X11** window managers (i3, …). It runs on the same
+full libghostty (OpenGL renderer, FreeType/HarfBuzz/fontconfig, the same VT engine)
+with a small Rust frontend in `linux/`, and reads the same
+`~/.config/ghostdrop/config`.
+
+```sh
+# Arch: pacman -S --needed base-devel rust clang libxkbcommon libxcb mesa
+git clone --recurse-submodules https://github.com/HackToHell/ghostdrop && cd ghostdrop
+scripts/build-linux.sh install   # Zig 0.17.1 is fetched if needed; installs to ~/.local
+```
+
+Wayland has no global key grabs, so the compositor runs `ghostdrop` on the hotkey
+(running it toggles the drop-down, starting it if needed):
+
+```
+# sway                                   # i3 (or let Ghostdrop grab `hotkey` itself)
+exec ghostdrop --daemon                  exec --no-startup-id ghostdrop --daemon
+bindsym ctrl+grave exec ghostdrop        bindsym ctrl+grave exec --no-startup-id ghostdrop
+
+# Hyprland
+exec-once = ghostdrop --daemon
+bind = CTRL, grave, exec, ghostdrop
+```
+
+What's different from macOS:
+
+* tab shortcuts are Ghostty's Linux defaults — `ctrl+shift+t` new, `ctrl+shift+w`
+  close, `ctrl+page_up/down` / `ctrl+tab` switch, `alt+1…9` jump, `ctrl+shift+c/v`
+  copy/paste (plus primary selection and middle-click), `ctrl+shift+f` search,
+  `ctrl+shift+,` reload;
+* it appears on the focused output (Wayland) or the monitor under the mouse (X11),
+  sized per monitor, with fractional scaling (`wp_fractional_scale_v1`; `Xft.dpi` on
+  X11); clicking another window hides it (`quick-terminal-autohide`);
+* config errors are shown in the drop-down and by `ghostdrop ctl reload`;
+* not yet: IME (text-input-v3 / XIM), slide animation, drag-to-resize, zero-copy
+  DMA-BUF presentation (libghostty renders on the GPU and frames are copied into a
+  shared-memory buffer).
+
+Measured in an Arch Linux ARM VM with **software** OpenGL (llvmpipe, no GPU):
+show → first frame **0.6–3 ms**, hotkey round-trip 3–4 ms, 65–75 MiB/s of `cat`,
+0 % CPU while hidden. `dev/vm/` has that VM (Apple `container`, i3 and sway
+desktops over VNC) and `dev/vm/tests/suite.sh` runs the end-to-end tests in it.
 
 ## Set up with AI
 
@@ -225,6 +272,14 @@ Sources/Ghostdrop/
 Resources/AGENTS.md     setup guide for AI agents (bundled into the app and the DMG)
 patches/ghostty/        patches applied to vendor/ghostty before building
 scripts/build-libghostty.sh
+linux/src/              the Linux app (Rust)
+  core.rs               backend-independent logic: tabs, placement, prompts, search, IPC commands
+  wayland.rs            wlr-layer-shell surface, input, clipboard, fractional scale
+  x11.rs                override-redirect window, MIT-SHM, XKB, hotkey grab, XInput2
+  ghostty.rs / tab.rs   libghostty runtime, config layering, one surface per tab
+  settings.rs, keys.rs, xkb.rs, draw.rs, ipc.rs
+scripts/build-linux.sh  builds libghostty (shared) + the Linux app, `install` to ~/.local
+dev/vm/                 Arch Linux test VM (i3 + sway over VNC) and tests/
 ```
 
 Input handling in `SurfaceView.swift` is adapted from Ghostty's macOS app

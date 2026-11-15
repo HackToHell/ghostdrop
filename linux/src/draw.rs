@@ -133,11 +133,7 @@ impl Font {
     fn glyph(&mut self, c: char, size: f32) -> Option<&(fontdue::Metrics, Vec<u8>)> {
         let font = self.font.as_ref()?;
         let key = (c, (size * 4.0) as u32);
-        if !self.cache.contains_key(&key) {
-            let g = font.rasterize(c, size);
-            self.cache.insert(key, g);
-        }
-        self.cache.get(&key)
+        Some(self.cache.entry(key).or_insert_with(|| font.rasterize(c, size)))
     }
 
     pub fn measure(&mut self, text: &str, size: f32) -> f32 {
@@ -169,6 +165,25 @@ impl Font {
         }
         out.push('…');
         out
+    }
+
+    /// Like `fit`, but keeps the end of the text (for input fields).
+    pub fn fit_tail(&mut self, text: &str, size: f32, max_w: f32) -> String {
+        if self.measure(text, size) <= max_w {
+            return text.to_string();
+        }
+        let ell = self.measure("…", size);
+        let mut tail: Vec<char> = Vec::new();
+        let mut w = 0.0;
+        for c in text.chars().rev() {
+            let cw = self.glyph(c, size).map_or(0.0, |g| g.0.advance_width);
+            if w + cw + ell > max_w {
+                break;
+            }
+            w += cw;
+            tail.push(c);
+        }
+        std::iter::once('…').chain(tail.into_iter().rev()).collect()
     }
 
     /// Draw `text` with its baseline at `baseline`; returns the advance.

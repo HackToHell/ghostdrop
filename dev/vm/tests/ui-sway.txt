@@ -1,0 +1,47 @@
+# sway: window at y=24 (below swaybar), tab bar (28px) appears with 2+ tabs
+sleep 1
+type seq 1 300
+key enter
+sleep 0.8
+move 600 324
+click 4
+click 4
+click 4
+click 4
+click 4
+sleep 0.6
+capture /tmp/gd-test/sui-1-scrolled.png
+key ctrl-shift-T
+sleep 1.2
+move 1584 38
+click 1
+sleep 1.2
+capture /tmp/gd-test/sui-2-three-tabs.png
+move 200 38
+click 1
+sleep 0.6
+move 1300 38
+click 2
+sleep 0.8
+capture /tmp/gd-test/sui-3-closed-third.png
+move 400 324
+type sleep 100
+key enter
+sleep 0.5
+key ctrl-shift-W
+sleep 0.8
+capture /tmp/gd-test/sui-4-prompt.png
+key esc
+sleep 0.5
+key ctrl-shift-F
+sleep 0.5
+type seq
+sleep 1
+capture /tmp/gd-test/sui-5-search.png
+key esc
+sleep 0.4
+key ctrl-shift-W
+sleep 0.6
+key enter
+sleep 0.8
+capture /tmp/gd-test/sui-6-after-close.png

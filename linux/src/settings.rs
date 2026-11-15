@@ -119,15 +119,15 @@ pub struct Settings {
     pub prespawn: bool,
     pub control_commands: bool,
     pub ghostty_lines: Vec<String>,
+    /// Line in the Ghostdrop config each `ghostty_lines` entry came from.
+    pub ghostty_line_src: Vec<usize>,
     pub errors: Vec<String>,
     pub created_template: bool,
 }
 
-/// Bindings Ghostty doesn't already provide on Linux.
-const DEFAULT_BINDINGS: &[(&str, &str)] = &[
-    ("ctrl+shift+page_up", "move_tab:-1"),
-    ("ctrl+shift+page_down", "move_tab:1"),
-];
+/// Bindings Ghostty doesn't already provide on Linux. (Its defaults already
+/// cover new/close/next/previous/move/goto tab, copy/paste and search.)
+const DEFAULT_BINDINGS: &[(&str, &str)] = &[];
 
 pub fn config_dir() -> PathBuf {
     if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
@@ -175,6 +175,7 @@ impl Settings {
             prespawn: true,
             control_commands: false,
             ghostty_lines: Vec::new(),
+            ghostty_line_src: Vec::new(),
             errors: Vec::new(),
             created_template: false,
         }
@@ -302,7 +303,10 @@ impl Settings {
                 "control-commands" => self.control_commands = parse_bool(&value),
                 // macOS-only options: accepted so shared configs don't error.
                 "status-item" | "dock-icon" => {}
-                _ => self.ghostty_lines.push(line.to_string()),
+                _ => {
+                    self.ghostty_lines.push(line.to_string());
+                    self.ghostty_line_src.push(ln);
+                }
             }
         }
     }

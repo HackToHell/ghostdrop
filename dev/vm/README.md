@@ -38,6 +38,40 @@ dev/vm/vm.sh stop | start | destroy
 If macOS Screen Sharing won't connect to the sway desktop (it doesn't speak every
 VNC auth scheme), use TigerVNC Viewer: `brew install --cask tigervnc-viewer`.
 
+## Tests
+
+Build in the VM, then run the suites (from the host unless noted):
+
+```sh
+dev/vm/vm.sh sync && dev/vm/vm.sh ssh 'cd ~/ghostdrop && scripts/build-linux.sh'
+dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/setup.sh'   # once: helpers + ctrl+` bindings
+dev/vm/tests/suite.sh                  # end-to-end on i3 and sway over VNC (hotkey, typing,
+                                       # clipboard both ways, tabs + tab bar, click-outside)
+dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/profiles.sh'   # profile commands, TERM override
+dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/perf.sh sway'  # latency/throughput/CPU (or x11)
+dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/leak.sh'       # open/close 75 tabs, RSS + malloc in-use
+dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/death.sh'      # display server dies → daemon exits
+dev/vm/vm.sh drive x11 < dev/vm/tests/ui-x11.txt   # screenshot tour → /tmp/gd-test/ui-*.png
+```
+
+`tests/probe.py` checks terminal protocols from inside the drop-down (kitty keyboard
+and graphics, DECRQM 2026, OSC 52, focus reports); run it in a tab, press
+`shift+enter`, `ctrl+i`, `esc`, and read `/tmp/probe.json`.
+
+Gotchas when driving the desktops:
+
+* Each `vm.sh drive` is a new VNC client whose pointer starts at (0,0): `move`
+  before `click` in the same script.
+* On sway the virtual keyboard exists only while a VNC client is connected, so
+  connecting/disconnecting looks like keyboard focus loss (autohide). `suite.sh`
+  keeps one client attached; do the same for manual runs.
+* TigerVNC doesn't auto-repeat held keys (real viewers send repeats themselves);
+  test X11 repeat with `xdotool keydown`.
+* Daemons that run non-shell commands ask before quitting: scripts use
+  `ghostdrop ctl quit force`.
+* `wl-copy` / `xclip` stay running to serve the selection: detach them
+  (`setsid -f sh -c '… | wl-copy' </dev/null >/dev/null 2>&1`) or ssh never returns.
+
 ## Isolation
 
 `container machine` normally mounts your whole home directory read-write and

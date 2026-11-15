@@ -187,7 +187,21 @@ impl Xkb {
             }
         }
 
-        let mods = self.mods();
+        // A modifier key's own press/release must be reflected in the mods
+        // (kitty protocol reports e.g. Shift press as `CSI 57441;2u`). X11
+        // delivers the XKB state update after the key event, so apply it here.
+        let mut mods = self.mods();
+        {
+            use xkb::keysyms as ks;
+            let down = state != KeyState::Release;
+            match sym.raw() {
+                ks::KEY_Shift_L | ks::KEY_Shift_R => mods.shift = down,
+                ks::KEY_Control_L | ks::KEY_Control_R => mods.ctrl = down,
+                ks::KEY_Alt_L | ks::KEY_Alt_R | ks::KEY_Meta_L | ks::KEY_Meta_R => mods.alt = down,
+                ks::KEY_Super_L | ks::KEY_Super_R | ks::KEY_Hyper_L | ks::KEY_Hyper_R => mods.sup = down,
+                _ => {}
+            }
+        }
         let mut gm = 0u32;
         if mods.shift {
             gm |= GHOSTTY_MODS_SHIFT as u32;

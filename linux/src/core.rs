@@ -12,6 +12,24 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::time::Instant;
 
+/// `GHOSTDROP_TRACE=1` logs lifecycle/input events to stderr.
+pub fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOSTDROP_TRACE").is_some())
+}
+
+macro_rules! trace {
+    ($($t:tt)*) => { if $crate::core::trace_on() { eprintln!("[trace {}] {}", $crate::core::trace_clock(), format!($($t)*)); } };
+}
+
+/// Wall-clock time of day (HH:MM:SS.mmm, UTC) for correlating traces with test scripts.
+pub fn trace_clock() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let s = d.as_secs() % 86400;
+    format!("{:02}:{:02}:{:02}.{:03}", s / 3600, s / 60 % 60, s % 60, d.subsec_millis())
+}
+pub(crate) use trace;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cursor {
     Default,
@@ -124,6 +142,8 @@ enum PromptKind {
     ClipWrite { clip: Clip, text: String },
     OpenUrl(String),
     Rename(SurfaceId),
+    /// Informational (config errors); any answer dismisses.
+    Notice,
 }
 
 struct Prompt {
@@ -172,6 +192,16 @@ pub struct Core {
     clip_reads: HashMap<u64, ClipRead>,
     next_token: u64,
     swallow: HashSet<u32>,
+    /// Focus was lost at this time; autohide fires if it hasn't come back.
+    autohide_at: Option<Instant>,
+    /// Hide at `autohide_at` even if we still have focus (click outside).
+    autohide_force: bool,
+    /// For tracing show -> first presented frame latency.
+    shown_at: Option<Instant>,
+    /// Config errors found at startup are shown on the first show.
+    notice_pending: bool,
+    /// Pending malloc_trim after tabs were closed.
+    trim_at: Option<Instant>,
     pub quit: bool,
     pub last_error: Option<String>,
 }
@@ -202,6 +232,7 @@ pub fn spawn_detached(program: &str, args: &[&str]) {
 
 impl Core {
     pub fn new(settings: Settings, rt: Runtime) -> Core {
+        let notice_pending = !settings.errors.is_empty();
         Core {
             settings,
             rt,
@@ -221,6 +252,11 @@ impl Core {
             clip_reads: HashMap::new(),
             next_token: 1,
             swallow: HashSet::new(),
+            autohide_at: None,
+            autohide_force: false,
+            shown_at: None,
+            notice_pending,
+            trim_at: None,
             quit: false,
             last_error: None,
         }
@@ -275,6 +311,10 @@ impl Core {
 
     /// Push size/scale to every surface (after resize, scale or tab-bar change).
     pub fn relayout(&mut self, w: &mut dyn Window) {
+        let (ww, wh) = w.size();
+        if ww == 0 || wh == 0 {
+            return; // not configured yet (Wayland); the configure will relayout
+        }
         let (_, _, tw, th) = self.term_rect(w);
         let scale = w.scale();
         for t in &self.tabs {
@@ -405,6 +445,10 @@ impl Core {
             self.search = None;
         }
         self.tabs.remove(idx); // drop frees the surface
+        // A surface's GL context and buffers free into glibc's per-thread
+        // arenas, which keep it (hundreds of MiB after many tabs). Hand it
+        // back to the OS once things settle.
+        self.trim_at = Some(Instant::now() + std::time::Duration::from_millis(1500));
         if self.tabs.is_empty() {
             self.selected = 0;
             self.hide(w);
@@ -432,11 +476,21 @@ impl Core {
     }
 
     pub fn show(&mut self, w: &mut dyn Window) {
+        trace!("show");
+        if trace_on() {
+            self.shown_at = Some(Instant::now());
+        }
         if self.tabs.is_empty() {
             self.new_tab(w, None);
         }
         let p = self.placement();
         w.show(&p);
+        if std::mem::take(&mut self.notice_pending) {
+            self.config_notice(w);
+        }
+        // The window may have moved to a monitor of a different size (X11
+        // sizes synchronously; Wayland relayouts again on configure).
+        self.relayout(w);
         let sel = self.selected;
         if let Some(t) = self.tabs.get(sel) {
             t.set_visible(true);
@@ -445,6 +499,9 @@ impl Core {
     }
 
     pub fn hide(&mut self, w: &mut dyn Window) {
+        trace!("hide");
+        self.autohide_at = None;
+        self.autohide_force = false;
         w.hide();
         for t in self.tabs.iter_mut() {
             t.set_visible(false);
@@ -467,18 +524,67 @@ impl Core {
 
     /// Backend reports keyboard focus changes.
     pub fn focus_changed(&mut self, w: &mut dyn Window, focused: bool) {
+        trace!("focus_changed {focused} visible={}", w.is_visible());
         self.rt.set_focus(focused);
         let sel = self.selected;
         if let Some(t) = self.tabs.get_mut(sel) {
             t.set_focus(focused);
         }
-        if !focused {
+        if focused {
+            if !self.autohide_force {
+                self.autohide_at = None;
+            }
+        } else {
             self.swallow.clear();
+            // Debounced: compositors/devices can bounce focus briefly
+            // (keyboard re-creation, layout switches). Only hide if it stays away.
             if w.is_visible() && self.prompt.is_none() && self.rt.bool("quick-terminal-autohide", true) {
-                self.hide(w);
+                self.autohide_at = Some(Instant::now() + std::time::Duration::from_millis(250));
             }
         }
         w.request_redraw();
+    }
+
+    /// The user clicked outside the dropdown (backends detect this their own way).
+    pub fn outside_click(&mut self, w: &mut dyn Window) {
+        if w.is_visible() && self.prompt.is_none() && self.rt.bool("quick-terminal-autohide", true) {
+            trace!("outside click -> autohide");
+            // Short delay so the WM's own focus change (if any) lands first;
+            // hide() then only restores focus if we still hold it.
+            self.autohide_at = Some(Instant::now() + std::time::Duration::from_millis(60));
+            self.autohide_force = true;
+        }
+    }
+
+    /// When the event loop should wake up for our timers.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        match (self.autohide_at, self.trim_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Fire due timers (called by the backends after each dispatch).
+    pub fn poll_timers(&mut self, w: &mut dyn Window) {
+        if self.trim_at.is_some_and(|t| Instant::now() >= t) {
+            self.trim_at = None;
+            // Takes tens of ms on a big heap; keep it off the UI thread.
+            let _ = std::thread::Builder::new().name("trim".into()).spawn(|| {
+                let t0 = Instant::now();
+                unsafe { libc::malloc_trim(0) };
+                trace!("malloc_trim {:.1} ms (background)", t0.elapsed().as_secs_f64() * 1e3);
+            });
+        }
+        if let Some(at) = self.autohide_at {
+            if Instant::now() >= at {
+                self.autohide_at = None;
+                let force = std::mem::take(&mut self.autohide_force);
+                if w.is_visible() && (force || !w.is_focused()) && self.prompt.is_none() {
+                    trace!("autohide");
+                    self.hide(w);
+                }
+            }
+        }
     }
 
     /// Backend reports the window was resized / rescaled.
@@ -538,6 +644,33 @@ impl Core {
             w.show(&p);
         }
         self.relayout(w);
+        self.config_notice(w);
+    }
+
+    /// Surface config problems in the dropdown (macOS shows them in its menu).
+    pub fn config_notice(&mut self, w: &mut dyn Window) {
+        let errs = &self.settings.errors;
+        if errs.is_empty() {
+            if self.prompt.as_ref().is_some_and(|p| matches!(p.kind, PromptKind::Notice)) {
+                self.prompt = None;
+            }
+            return;
+        }
+        if self.prompt.as_ref().is_some_and(|p| !matches!(p.kind, PromptKind::Notice)) {
+            return; // don't clobber a question
+        }
+        let mut detail: Vec<String> = errs.iter().take(3).cloned().collect();
+        if errs.len() > 3 {
+            detail.push(format!("… and {} more", errs.len() - 3));
+        }
+        detail.push("Run `ghostdrop check` for details; fix and reload.".into());
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Notice,
+            title: format!("Config: {} issue{}", errs.len(), if errs.len() == 1 { "" } else { "s" }),
+            detail: detail.join("\n"),
+            input: None,
+        });
+        w.request_redraw();
     }
 
     fn request_quit(&mut self, w: &mut dyn Window) {
@@ -612,6 +745,9 @@ impl Core {
     }
 
     fn handle(&mut self, w: &mut dyn Window, ev: GEvent) {
+        if !matches!(ev, GEvent::Render(_)) {
+            trace!("event {ev:?}");
+        }
         match ev {
             GEvent::Render(id) => {
                 if let Some(i) = self.tab_index(id) {
@@ -918,6 +1054,7 @@ impl Core {
                     self.quit = true;
                 }
             }
+            PromptKind::Notice => {}
             PromptKind::ClipConfirm { sid, text, state } => {
                 if let Some(i) = self.tab_index(sid) {
                     let s = self.tabs[i].surface;
@@ -1035,6 +1172,9 @@ impl Core {
     }
 
     pub fn pointer(&mut self, w: &mut dyn Window, ev: PointerInput, mods: Mods) {
+        if !matches!(ev, PointerInput::Motion { .. }) {
+            trace!("pointer {ev:?}");
+        }
         let gm = (if mods.shift { GHOSTTY_MODS_SHIFT as u32 } else { 0 })
             | (if mods.ctrl { GHOSTTY_MODS_CTRL as u32 } else { 0 })
             | (if mods.alt { GHOSTTY_MODS_ALT as u32 } else { 0 })
@@ -1095,9 +1235,9 @@ impl Core {
                 if let Some(s) = surface {
                     let (x, y) = self.mouse;
                     if !self.in_tab_bar(w, x, y) {
-                        // Natural scrolling inversion, like Ghostty's GTK app.
-                        let m = if precise { 1.0 } else { 1.0 };
-                        unsafe { ghostty_surface_mouse_scroll(s, -dx * m, -dy * m, precise as i32) };
+                        // Wayland/X11 report positive = down/right; Ghostty wants
+                        // positive = up/left (same inversion as its GTK app).
+                        unsafe { ghostty_surface_mouse_scroll(s, -dx, -dy, precise as i32) };
                     }
                 }
             }
@@ -1133,6 +1273,16 @@ impl Core {
 
     /// Compose a full frame. `size`/`scale` describe the window being drawn.
     pub fn draw(&mut self, size: (u32, u32), scale64: f64, c: &mut Canvas) {
+        let t0 = Instant::now();
+        self.draw_inner(size, scale64, c);
+        if let Some(at) = self.shown_at.take() {
+            trace!("first frame {:.1} ms after show (draw {:.2} ms)", at.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64() * 1e3);
+        } else if std::env::var_os("GHOSTDROP_TRACE_FRAMES").is_some() {
+            trace!("frame {}x{} draw {:.2} ms", size.0, size.1, t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    fn draw_inner(&mut self, size: (u32, u32), scale64: f64, c: &mut Canvas) {
         let scale = scale64 as f32;
         let (bg, fg) = self.colors();
         let (tx, ty, tw, th) = self.term_rect_at(size, scale64);
@@ -1211,7 +1361,7 @@ impl Core {
         } else {
             format!("-/{}", s.total)
         };
-        let text = format!("Search: {}▏", s.needle);
+        let text = format!("Search: {}", s.needle);
         let bw = (360.0 * scale) as i32;
         let bh = (32.0 * scale) as i32;
         let x = c.width as i32 - bw - (12.0 * scale) as i32;
@@ -1222,16 +1372,20 @@ impl Core {
         let (asc, desc) = self.font.line_metrics(size);
         let base = y as f32 + (bh as f32 + asc - desc) / 2.0;
         let cw = self.font.measure(&count, size);
-        let fit = self.font.fit(&text, size, bw as f32 - cw - 30.0 * scale);
-        self.font.draw(c, x as f32 + 10.0 * scale, base, &fit, size, fg, x + bw);
+        let fit = self.font.fit_tail(&text, size, bw as f32 - cw - 34.0 * scale);
+        let adv = self.font.draw(c, x as f32 + 10.0 * scale, base, &fit, size, fg, x + bw);
+        // Text cursor: a thin bar (box-drawing glyphs aren't in every UI font).
+        let cx = (x as f32 + 10.0 * scale + adv + 1.0 * scale) as i32;
+        c.fill(cx, (base - asc) as i32, (1.0 * scale).max(1.0) as i32, (asc + desc) as i32, fg);
         self.font.draw(c, (x + bw) as f32 - cw - 10.0 * scale, base, &count, size, mix(panel, fg, 0.6), x + bw);
     }
 
     fn draw_prompt(&mut self, c: &mut Canvas, scale: f32, bg: Rgb, fg: Rgb) {
         let Some(p) = self.prompt.as_ref() else { return };
         let title = p.title.clone();
+        let notice = matches!(p.kind, PromptKind::Notice);
         let input = p.input.clone();
-        let detail: Vec<String> = p.detail.lines().take(4).map(|l| l.to_string()).collect();
+        let detail: Vec<String> = p.detail.lines().take(5).map(|l| l.to_string()).collect();
         let size = 14.0 * scale;
         let small = 12.5 * scale;
         let bw = ((560.0 * scale) as i32).min(c.width as i32 - (40.0 * scale) as i32).max(100);
@@ -1256,12 +1410,15 @@ impl Core {
             base += lh as f32 + 4.0 * scale;
             let fx = x + pad as i32;
             c.fill(fx - 4, (base - size) as i32 - 4, bw - 2 * pad as i32 + 8, lh + 4, bg);
-            let shown = format!("{inp}▏");
-            let shown = self.font.fit(&shown, size, bw as f32 - 2.0 * pad);
-            self.font.draw(c, fx as f32, base, &shown, size, fg, x + bw);
+            let shown = self.font.fit_tail(&inp, size, bw as f32 - 2.0 * pad - 4.0 * scale);
+            let adv = self.font.draw(c, fx as f32, base, &shown, size, fg, x + bw);
+            let (asc, desc) = self.font.line_metrics(size);
+            let cx = (fx as f32 + adv + 1.0 * scale) as i32;
+            c.fill(cx, (base - asc) as i32, (1.0 * scale).max(1.0) as i32, (asc + desc) as i32, fg);
         }
         base += lh as f32 * 1.4;
-        self.font.draw(c, x as f32 + pad, base, "Enter: OK      Esc: Cancel", small, mix(panel, fg, 0.55), x + bw);
+        let hint = if notice { "Enter / Esc: Dismiss" } else { "Enter: OK      Esc: Cancel" };
+        self.font.draw(c, x as f32 + pad, base, hint, small, mix(panel, fg, 0.55), x + bw);
     }
 
     // ------------------------------------------------------------ IPC
@@ -1285,7 +1442,13 @@ impl Core {
                 "ok".into()
             }
             "new-tab" => {
-                self.perform(w, &Action::NewTab(arg.filter(|a| !a.is_empty())));
+                let name = arg.filter(|a| !a.is_empty());
+                if let Some(n) = name.as_deref().filter(|n| !self.settings.profiles.contains_key(*n)) {
+                    let mut have: Vec<&str> = self.settings.profiles.keys().map(|k| k.as_str()).collect();
+                    have.sort();
+                    return format!("error: no profile '{n}' (have: {})", have.join(", "));
+                }
+                self.perform(w, &Action::NewTab(name));
                 "ok".into()
             }
             "next-tab" => {
@@ -1298,10 +1461,18 @@ impl Core {
             }
             "reload" => {
                 self.reload(w);
-                "ok".into()
+                if self.settings.errors.is_empty() {
+                    "ok".into()
+                } else {
+                    format!("error: {}", self.settings.errors.join("\nerror: "))
+                }
             }
             "quit" => {
-                self.request_quit(w);
+                if arg.as_deref() == Some("force") {
+                    self.quit = true; // scripts/upgrades: no confirmation
+                } else {
+                    self.request_quit(w);
+                }
                 "ok".into()
             }
             "ping" => "pong".into(),
@@ -1317,6 +1488,7 @@ impl Core {
     fn debug_command(&mut self, w: &mut dyn Window, cmd: &str, arg: Option<String>) -> String {
         match cmd {
             "dump" => self.dump(w),
+            "mem" => crate::mem_report(arg.as_deref() == Some("trim")),
             "binding" => {
                 let ok = self.selected_tab().is_some_and(|t| t.binding_action(&arg.unwrap_or_default()));
                 format!("{ok}")

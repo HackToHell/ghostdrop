@@ -1,7 +1,8 @@
-// Generates Rust bindings for libghostty's embedding API and links the static library.
+// Generates Rust bindings for libghostty's embedding API and links the shared
+// library (see scripts/build-linux.sh).
 //
 // GHOSTTY_DIR points at a libghostty install prefix (include/ghostty.h,
-// lib/libghostty.a); defaults to ../build/ghostty-linux.
+// lib/ghostty-internal.so); defaults to ../build/ghostty-linux.
 use std::{env, path::PathBuf};
 
 fn main() {
@@ -13,7 +14,6 @@ fn main() {
     let lib = dir.join("lib");
     println!("cargo:rerun-if-env-changed=GHOSTTY_DIR");
     println!("cargo:rerun-if-changed={}", header.display());
-    println!("cargo:rerun-if-changed={}", lib.join("libghostty.a").display());
 
     let bindings = bindgen::Builder::default()
         .header(header.to_str().unwrap())

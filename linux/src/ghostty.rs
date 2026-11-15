@@ -316,9 +316,17 @@ impl Runtime {
             ghostty_config_load_recursive_files(cfg);
             ghostty_config_finalize(cfg);
             let n = ghostty_config_diagnostics_count(cfg);
+            // Point at the user's file/line, not our scratch overrides file.
+            let over = format!("{}:", dir.join("overrides.conf").display());
             for i in 0..n {
                 let d = ghostty_config_get_diagnostic(cfg, i);
-                settings.errors.push(format!("ghostty: {}", cstr(d.message)));
+                let msg = cstr(d.message);
+                let mapped = msg.strip_prefix(&over).and_then(|rest| {
+                    let (num, tail) = rest.split_once(':')?;
+                    let src = settings.ghostty_line_src.get(num.parse::<usize>().ok()?.checked_sub(1)?)?;
+                    Some(format!("{} line {src}: {}", Settings::path().display(), tail.trim_start()))
+                });
+                settings.errors.push(mapped.unwrap_or_else(|| format!("ghostty: {msg}")));
             }
             cfg
         }

@@ -12,8 +12,8 @@
 
 ## For AI agents
 
-You are configuring **Ghostdrop**, a native macOS drop-down (Quake-style) terminal
-built on libghostty (Ghostty's terminal engine). It has a global show/hide hotkey,
+You are configuring **Ghostdrop**, a native drop-down (Quake-style) terminal for
+macOS and Linux, built on libghostty (Ghostty's terminal engine). It has a global show/hide hotkey,
 tabs, and profiles. Your job: understand how the user wants it to behave, write
 **one config file**, validate it, reload the app, and confirm with the user.
 
@@ -32,6 +32,34 @@ tabs, and profiles. Your job: understand how the user wants it to behave, write
   quarantine removal, installing terminfo on remote hosts).
 - Ask questions in one compact batch with proposed defaults the user can accept,
   rather than one at a time.
+
+### On Linux
+
+Everything in this guide applies, except (check `uname` first):
+
+- **Binary**: `G="$(command -v ghostdrop || echo "$HOME/.local/bin/ghostdrop")"`; there
+  is no app bundle, menu-bar icon, Dock icon or login item (`status-item`,
+  `dock-icon`, `ctl login-item` don't apply). Engine docs: `"$G" +show-config --default --docs`.
+- **Start/autostart**: from the window manager config, e.g. sway/i3
+  `exec ghostdrop --daemon`. Running `ghostdrop` with no arguments toggles the
+  drop-down, starting it first if needed.
+- **Hotkey**: Wayland has no global key grabs, so bind the key **in the compositor**
+  to run `ghostdrop`: sway `bindsym ctrl+grave exec ghostdrop`, Hyprland
+  `bind = CTRL, grave, exec, ghostdrop`. On X11 Ghostdrop grabs `hotkey` itself; if
+  the window manager already uses that key, bind it there instead (i3:
+  `bindsym ctrl+grave exec --no-startup-id ghostdrop`). Edit the WM config only with
+  the user's OK, then reload the WM (`swaymsg reload`, `i3-msg reload`).
+- **Tab shortcuts**: Ghostty's Linux defaults: `ctrl+shift+t` new tab, `ctrl+shift+w`
+  close, `ctrl+page_up/down` or `ctrl+tab` switch, `alt+1…9` go to tab,
+  `ctrl+shift+c/v` copy/paste, `ctrl+shift+f` search, `ctrl+shift+,` reload config.
+- **Placement**: Wayland shows it on the focused output; X11 on the monitor under
+  the mouse (`quick-terminal-screen = main` for the primary). Wayland only:
+  `quick-terminal-keyboard-interactivity = on-demand` (default; Ghostdrop switches to
+  `exclusive` itself on compositors such as sway that drop on-demand focus) or
+  `exclusive`. `quick-terminal-animation-duration` is ignored (no animation).
+- **Ghostty config** that is inherited: `~/.config/ghostty/config` and
+  `~/.config/ghostty/config.ghostty`.
+- **Errors**: `ghostdrop ctl reload` prints config errors and the drop-down shows them.
 
 ### Tools
 
