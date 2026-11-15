@@ -52,6 +52,9 @@ if [ -z "$METAL_RUNTIME" ]; then
 fi
 
 echo "==> building libghostty (metal-runtime-compile=$METAL_RUNTIME)"
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  echo "::notice title=Metal shaders::$([ "$METAL_RUNTIME" = false ] && echo precompiled metallib || echo compiled at runtime)"
+fi
 cd "$GHOSTTY"
 # Clean PATH: stray pkg-config shims confuse the build.
 env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" "$ZIG" build \
