@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Cache Zig toolchain and packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .tools
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.gitmodules', 'scripts/build-libghostty.sh', 'patches/**') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Metal toolchain (precompiled shaders)
+        run: xcodebuild -downloadComponent MetalToolchain || echo "::warning::Metal toolchain unavailable; shaders will be compiled at runtime"
+
+      - name: Build
+        run: ./scripts/ci-run.sh make app
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          G=build/Ghostdrop.app/Contents/MacOS/ghostdrop
+          codesign --verify --strict build/Ghostdrop.app
+          GHOSTDROP_CONFIG="$RUNNER_TEMP/gd/config" "$G" check
+          # Fresh runner has no Ghostty config: Ghostdrop must not create Ghostty files.
+          test ! -e "$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
+          "$G" +version
+          test -f build/Ghostdrop.app/Contents/Resources/AGENTS.md
+          test -f build/Ghostdrop.app/Contents/Resources/terminfo/78/xterm-ghostty

@@ -88,7 +88,9 @@ final class GhosttyRuntime {
         try? Self.defaultGhosttyConfig.write(toFile: defaults, atomically: true, encoding: .utf8)
         ghostty_config_load_file(cfg, defaults)
 
-        if settings.inheritGhosttyConfig {
+        // Only when the user actually has a Ghostty config: otherwise libghostty
+        // would create a Ghostty template file on Macs that don't use Ghostty.
+        if settings.inheritGhosttyConfig && Self.hasGhosttyConfig {
             ghostty_config_load_default_files(cfg)
         }
 
@@ -107,6 +109,20 @@ final class GhosttyRuntime {
             if let m = d.message { settings.errors.append("ghostty: " + String(cString: m)) }
         }
         return cfg
+    }
+
+    static var hasGhosttyConfig: Bool {
+        let home = NSHomeDirectory() as NSString
+        let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? home.appendingPathComponent(".config")
+        let support = home.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty")
+        let candidates = [
+            (xdg as NSString).appendingPathComponent("ghostty/config"),
+            (xdg as NSString).appendingPathComponent("ghostty/config.ghostty"),
+            (support as NSString).appendingPathComponent("config"),
+            (support as NSString).appendingPathComponent("config.ghostty"),
+        ]
+        return candidates.contains { FileManager.default.fileExists(atPath: $0) }
     }
 
     /// Ghostdrop's opinionated defaults, overridable by any config file.

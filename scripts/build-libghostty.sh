@@ -39,8 +39,17 @@ done
 
 # Precompile shaders when the Metal toolchain exists (full Xcode); otherwise
 # embed the source and compile once at runtime (cached by Metal).
-METAL_RUNTIME=true
-if xcrun -sdk macosx -f metal >/dev/null 2>&1; then METAL_RUNTIME=false; fi
+# (Probe by compiling: Xcode 26 ships a `metal` stub even without the toolchain.)
+METAL_RUNTIME="${GHOSTDROP_METAL_RUNTIME:-}"
+if [ -z "$METAL_RUNTIME" ]; then
+  METAL_RUNTIME=true
+  probe="$(mktemp -d)"
+  printf 'kernel void k() {}\n' > "$probe/p.metal"
+  if xcrun -sdk macosx metal -c "$probe/p.metal" -o "$probe/p.air" >/dev/null 2>&1; then
+    METAL_RUNTIME=false
+  fi
+  rm -rf "$probe"
+fi
 
 echo "==> building libghostty (metal-runtime-compile=$METAL_RUNTIME)"
 cd "$GHOSTTY"

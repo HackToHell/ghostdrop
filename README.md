@@ -16,6 +16,13 @@ cmd+f             search                      cmd+shift+,  reload config
 drag free edge    resize (remembered)         double-click edge  reset size
 ```
 
+## Download
+
+Grab the latest **`Ghostdrop-<version>.dmg`** from
+[Releases](https://github.com/HackToHell/ghostdrop/releases/latest), open it and
+drag Ghostdrop to Applications (Apple Silicon, macOS 13+). Builds aren't notarized
+yet: on first launch use *System Settings → Privacy & Security → Open Anyway*.
+
 ## Why
 
 On Linux, Guake/Yakuake/Tilda give you a drop-down terminal with tabs. On macOS
@@ -71,7 +78,7 @@ DECRQM 2026, OSC 52 → macOS pasteboard, focus in/out reports.
 Only the Xcode **Command Line Tools** are required (no full Xcode):
 
 ```sh
-git clone --recurse-submodules <this repo> && cd ghostdrop
+git clone --recurse-submodules https://github.com/HackToHell/ghostdrop && cd ghostdrop
 make            # builds libghostty (downloads Zig 0.17.1 into .tools/ if needed) + the app
 make install    # copies Ghostdrop.app to /Applications (PREFIX=~/Applications to change)
 open /Applications/Ghostdrop.app
@@ -85,6 +92,12 @@ Then enable *Launch at Login* from the menu-bar icon.
 make dmg                                   # build/Ghostdrop-<version>.dmg
 make dmg SIGN_IDENTITY="Developer ID Application: …" && make notarize   # for public downloads
 ```
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`): bump
+`CFBundleShortVersionString` in `Resources/Info.plist`, add
+`.github/release-notes/v<version>.md`, then push a `v<version>` tag. The workflow
+builds on a macOS 26 arm64 runner (with precompiled Metal shaders), verifies the disk
+image, and publishes it with a SHA-256 checksum.
 
 The disk image contains `Ghostdrop.app`, an `Applications` shortcut to drag it onto,
 and **`Set Up with AI.md`**. If someone launches the app straight from the disk image,
