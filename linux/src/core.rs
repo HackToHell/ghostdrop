@@ -8,7 +8,7 @@ use crate::keys::Mods;
 use crate::settings::{Action, Settings, TabBarMode};
 use crate::tab::{Frame, Tab};
 use crate::xkb::{KeyInput, KeyState};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::time::Instant;
 
@@ -107,8 +107,9 @@ pub trait Window {
     fn hide(&mut self);
     fn is_visible(&self) -> bool;
     fn is_focused(&self) -> bool;
-    /// Try to take keyboard focus while visible.
-    fn focus(&mut self) {}
+    /// Take keyboard focus while visible (`toggle` on a visible but
+    /// unfocused window relies on this, so every backend must implement it).
+    fn focus(&mut self);
     fn scale(&self) -> f64;
     /// Physical size of the mapped window.
     fn size(&self) -> (u32, u32);
@@ -124,6 +125,9 @@ pub trait Window {
     fn request_present(&mut self) {
         self.request_redraw();
     }
+    /// Stop presenting DMA-BUF frames directly (CPU frames from now on).
+    /// Called through `Core::gpu_failed`, which also switches the tabs.
+    fn disable_gpu(&mut self, why: &str);
     /// Debug: write what the window shows to a PPM file.
     fn snapshot(&mut self, _path: &str) -> Result<(), String> {
         Err("snapshot is not supported by this backend".into())
@@ -185,6 +189,70 @@ enum Hover {
     Plus,
 }
 
+/// Who owns the pointer between a button press and its release. Drags and
+/// the release go to whoever got the press, wherever the pointer is by then
+/// (the display server keeps sending us the pointer while a button is held).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Capture {
+    None,
+    /// `button` went down on the tab bar. `drag` = the tab being dragged
+    /// (left button on a tab) and the x where it last moved.
+    Bar { button: Button, drag: Option<(SurfaceId, f64)> },
+    /// Buttons held in this tab's terminal (bit mask of ghostty button codes).
+    Terminal { id: SurfaceId, held: u32 },
+}
+
+fn button_bit(b: Button) -> u32 {
+    1u32 << (ghostty_button(b) as u32 & 31)
+}
+
+/// Where a key press went; its repeats and its release follow it there, even
+/// if a prompt opened or closed in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyTarget {
+    /// Ghostdrop used it: a binding, the prompt or the search field.
+    Ui,
+    /// Sent to this tab's terminal.
+    Terminal(SurfaceId),
+}
+
+/// Pending autohide. Each variant carries the time it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Autohide {
+    Idle,
+    /// Keyboard focus went away; hide unless it comes back by then
+    /// (compositors and devices bounce focus briefly).
+    FocusLost(Instant),
+    /// The user clicked outside; hide even if we still hold focus.
+    OutsideClick(Instant),
+}
+
+impl Autohide {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Autohide::Idle => None,
+            Autohide::FocusLost(t) | Autohide::OutsideClick(t) => Some(t),
+        }
+    }
+}
+
+fn prompt_about(p: &Prompt, id: SurfaceId) -> bool {
+    match p.kind {
+        PromptKind::CloseTab(x) | PromptKind::Rename(x) => x == id,
+        PromptKind::ClipConfirm { sid, .. } => sid == id,
+        _ => false,
+    }
+}
+
+/// The same question asked twice (e.g. close requested again) is asked once.
+fn same_question(a: &PromptKind, b: &PromptKind) -> bool {
+    match (a, b) {
+        (PromptKind::CloseTab(x), PromptKind::CloseTab(y)) | (PromptKind::Rename(x), PromptKind::Rename(y)) => x == y,
+        (PromptKind::Quit, PromptKind::Quit) => true,
+        _ => false,
+    }
+}
+
 pub struct Core {
     pub settings: Settings,
     pub rt: Runtime,
@@ -195,19 +263,18 @@ pub struct Core {
     font: Font,
     hover: Option<Hover>,
     mouse: (f64, f64),
-    pressed_in_bar: Option<(usize, f64)>,
+    capture: Capture,
     last_bar_click: Option<Instant>,
     term_cursor: Cursor,
     cursor_shown: Option<Cursor>,
+    /// The prompt on screen; `prompts` wait behind it (never set without it).
     prompt: Option<Prompt>,
+    prompts: VecDeque<Prompt>,
     search: Option<Search>,
     clip_reads: HashMap<u64, ClipRead>,
     next_token: u64,
-    swallow: HashSet<u32>,
-    /// Focus was lost at this time; autohide fires if it hasn't come back.
-    autohide_at: Option<Instant>,
-    /// Hide at `autohide_at` even if we still have focus (click outside).
-    autohide_force: bool,
+    keys_down: HashMap<u32, KeyTarget>,
+    autohide: Autohide,
     /// For tracing show -> first presented frame latency.
     shown_at: Option<Instant>,
     /// Config errors found at startup are shown on the first show.
@@ -261,17 +328,17 @@ impl Core {
             font: Font::load(),
             hover: None,
             mouse: (-1.0, -1.0),
-            pressed_in_bar: None,
+            capture: Capture::None,
             last_bar_click: None,
             term_cursor: Cursor::Text,
             cursor_shown: None,
             prompt: None,
+            prompts: VecDeque::new(),
             search: None,
             clip_reads: HashMap::new(),
             next_token: 1,
-            swallow: HashSet::new(),
-            autohide_at: None,
-            autohide_force: false,
+            keys_down: HashMap::new(),
+            autohide: Autohide::Idle,
             shown_at: None,
             notice_pending,
             trim_at: None,
@@ -465,6 +532,23 @@ impl Core {
         if self.search.as_ref().is_some_and(|s| s.sid == id) {
             self.search = None;
         }
+        // Questions about this tab are moot now (its surface, and any
+        // clipboard request it made, goes away with it).
+        self.prompts.retain(|p| !prompt_about(p, id));
+        let prompt_gone = self.prompt.as_ref().is_some_and(|p| prompt_about(p, id));
+        if prompt_gone {
+            self.prompt = self.prompts.pop_front();
+            w.request_redraw();
+        }
+        if matches!(self.capture, Capture::Terminal { id: c, .. } if c == id) {
+            self.capture = Capture::None;
+        }
+        if let Capture::Bar { drag, .. } = &mut self.capture {
+            if drag.is_some_and(|(d, _)| d == id) {
+                *drag = None;
+            }
+        }
+        self.keys_down.retain(|_, t| *t != KeyTarget::Terminal(id));
         self.tabs.remove(idx); // drop frees the surface
         // A surface's GL context and buffers free into glibc's per-thread
         // arenas, which keep it (hundreds of MiB after many tabs). Hand it
@@ -482,6 +566,9 @@ impl Core {
         self.select(w, sel);
         if had_bar != self.tab_bar_visible() {
             self.relayout(w);
+        }
+        if prompt_gone {
+            self.show_prompt_tab(w);
         }
     }
 
@@ -525,8 +612,10 @@ impl Core {
 
     pub fn hide(&mut self, w: &mut dyn Window) {
         trace!("hide");
-        self.autohide_at = None;
-        self.autohide_force = false;
+        self.autohide = Autohide::Idle;
+        // The release of a held button won't reach us once we're gone.
+        self.release_capture();
+        self.keys_down.clear();
         w.hide();
         for t in self.tabs.iter_mut() {
             t.set_visible(false);
@@ -561,15 +650,21 @@ impl Core {
             t.set_focus(focused);
         }
         if focused {
-            if !self.autohide_force {
-                self.autohide_at = None;
+            // A click outside still hides even though focus is back.
+            if matches!(self.autohide, Autohide::FocusLost(_)) {
+                self.autohide = Autohide::Idle;
             }
         } else {
-            self.swallow.clear();
+            self.keys_down.clear();
             // Debounced: compositors/devices can bounce focus briefly
             // (keyboard re-creation, layout switches). Only hide if it stays away.
-            if w.is_visible() && self.prompt.is_none() && self.rt.bool("quick-terminal-autohide", true) {
-                self.autohide_at = Some(Instant::now() + std::time::Duration::from_millis(250));
+            // A pending outside-click hide keeps its (earlier) deadline.
+            if self.autohide == Autohide::Idle
+                && w.is_visible()
+                && self.prompt.is_none()
+                && self.rt.bool("quick-terminal-autohide", true)
+            {
+                self.autohide = Autohide::FocusLost(Instant::now() + std::time::Duration::from_millis(250));
             }
         }
         w.request_redraw();
@@ -581,7 +676,15 @@ impl Core {
             trace!("gpu presentation {}", if on { "on" } else { "off" });
         }
         self.gpu_backend = on;
+        self.gpu_misses = 0;
         self.sync_gpu();
+    }
+
+    /// Zero-copy presentation failed (import, present or export): the backend
+    /// and the tabs both go back to CPU frames, together.
+    pub fn gpu_failed(&mut self, w: &mut dyn Window, why: &str) {
+        w.disable_gpu(why);
+        self.set_gpu_backend(false);
     }
 
     /// GPU frames when the backend can present them and nothing is drawn on
@@ -609,14 +712,13 @@ impl Core {
             trace!("outside click -> autohide");
             // Short delay so the WM's own focus change (if any) lands first;
             // hide() then only restores focus if we still hold it.
-            self.autohide_at = Some(Instant::now() + std::time::Duration::from_millis(60));
-            self.autohide_force = true;
+            self.autohide = Autohide::OutsideClick(Instant::now() + std::time::Duration::from_millis(60));
         }
     }
 
     /// When the event loop should wake up for our timers.
     pub fn next_deadline(&self) -> Option<Instant> {
-        match (self.autohide_at, self.trim_at) {
+        match (self.autohide.deadline(), self.trim_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -633,14 +735,12 @@ impl Core {
                 trace!("malloc_trim {:.1} ms (background)", t0.elapsed().as_secs_f64() * 1e3);
             });
         }
-        if let Some(at) = self.autohide_at {
-            if Instant::now() >= at {
-                self.autohide_at = None;
-                let force = std::mem::take(&mut self.autohide_force);
-                if w.is_visible() && (force || !w.is_focused()) && self.prompt.is_none() {
-                    trace!("autohide");
-                    self.hide(w);
-                }
+        if self.autohide.deadline().is_some_and(|at| Instant::now() >= at) {
+            let forced = matches!(self.autohide, Autohide::OutsideClick(_));
+            self.autohide = Autohide::Idle;
+            if w.is_visible() && (forced || !w.is_focused()) && self.prompt.is_none() {
+                trace!("autohide");
+                self.hide(w);
             }
         }
     }
@@ -707,40 +807,79 @@ impl Core {
 
     /// Surface config problems in the dropdown (macOS shows them in its menu).
     pub fn config_notice(&mut self, w: &mut dyn Window) {
+        let is_notice = |p: &Prompt| matches!(p.kind, PromptKind::Notice);
         let errs = &self.settings.errors;
         if errs.is_empty() {
-            if self.prompt.as_ref().is_some_and(|p| matches!(p.kind, PromptKind::Notice)) {
-                self.prompt = None;
+            self.prompts.retain(|p| !is_notice(p));
+            if self.prompt.as_ref().is_some_and(is_notice) {
+                self.prompt = self.prompts.pop_front();
             }
+            w.request_redraw();
             return;
-        }
-        if self.prompt.as_ref().is_some_and(|p| !matches!(p.kind, PromptKind::Notice)) {
-            return; // don't clobber a question
         }
         let mut detail: Vec<String> = errs.iter().take(3).cloned().collect();
         if errs.len() > 3 {
             detail.push(format!("… and {} more", errs.len() - 3));
         }
         detail.push("Run `ghostdrop check` for details; fix and reload.".into());
-        self.prompt = Some(Prompt {
+        let notice = Prompt {
             kind: PromptKind::Notice,
             title: format!("Config: {} issue{}", errs.len(), if errs.len() == 1 { "" } else { "s" }),
             detail: detail.join("\n"),
             input: None,
-        });
+        };
+        // Update the notice in place, else show it, else queue it behind
+        // the questions (never replace one).
+        if let Some(slot) = self.prompt.iter_mut().chain(self.prompts.iter_mut()).find(|p| is_notice(p)) {
+            *slot = notice;
+        } else if self.prompt.is_none() {
+            self.prompt = Some(notice);
+        } else {
+            self.prompts.push_back(notice);
+        }
         w.request_redraw();
+    }
+
+    /// Ask a question. Questions are answered one at a time, in order:
+    /// replacing one would drop it unanswered (a clipboard request would
+    /// never be completed, a tab never closed). A config notice on screen
+    /// steps back behind it.
+    fn ask(&mut self, w: &mut dyn Window, kind: PromptKind, title: String, detail: String, input: Option<String>) {
+        self.ensure_visible(w);
+        if self.prompt.iter().chain(self.prompts.iter()).any(|p| same_question(&p.kind, &kind)) {
+            return;
+        }
+        let p = Prompt { kind, title, detail, input };
+        match self.prompt.take() {
+            None => self.prompt = Some(p),
+            Some(n) if matches!(n.kind, PromptKind::Notice) => {
+                self.prompts.push_front(n);
+                self.prompt = Some(p);
+            }
+            Some(cur) => {
+                self.prompt = Some(cur);
+                self.prompts.push_back(p);
+            }
+        }
+        self.show_prompt_tab(w);
+        w.request_redraw();
+    }
+
+    /// A question about a tab is asked with that tab in front (when it comes
+    /// on screen, not when it was queued).
+    fn show_prompt_tab(&mut self, w: &mut dyn Window) {
+        let id = match self.prompt.as_ref().map(|p| &p.kind) {
+            Some(PromptKind::CloseTab(id) | PromptKind::Rename(id)) => *id,
+            _ => return,
+        };
+        if let Some(i) = self.tab_index(id).filter(|i| *i != self.selected) {
+            self.select(w, i);
+        }
     }
 
     fn request_quit(&mut self, w: &mut dyn Window) {
         if self.rt.needs_confirm_quit() {
-            self.ensure_visible(w);
-            self.prompt = Some(Prompt {
-                kind: PromptKind::Quit,
-                title: "Quit Ghostdrop?".into(),
-                detail: "Processes are still running in some tabs.".into(),
-                input: None,
-            });
-            w.request_redraw();
+            self.ask(w, PromptKind::Quit, "Quit Ghostdrop?".into(), "Processes are still running in some tabs.".into(), None);
         } else {
             self.quit = true;
         }
@@ -754,14 +893,7 @@ impl Core {
 
     fn prompt_rename(&mut self, w: &mut dyn Window, id: SurfaceId) {
         let cur = self.tab_index(id).and_then(|i| self.tabs[i].title_override.clone()).unwrap_or_default();
-        self.ensure_visible(w);
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Rename(id),
-            title: "Rename tab".into(),
-            detail: "Empty = use the title set by the terminal.".into(),
-            input: Some(cur),
-        });
-        w.request_redraw();
+        self.ask(w, PromptKind::Rename(id), "Rename tab".into(), "Empty = use the title set by the terminal.".into(), Some(cur));
     }
 
     fn open_url(&mut self, w: &mut dyn Window, url: String, trusted: bool) {
@@ -770,14 +902,7 @@ impl Core {
         if trusted || safe {
             spawn_detached("xdg-open", &[&url]);
         } else {
-            self.ensure_visible(w);
-            self.prompt = Some(Prompt {
-                kind: PromptKind::OpenUrl(url.clone()),
-                title: "Open this link?".into(),
-                detail: url,
-                input: None,
-            });
-            w.request_redraw();
+            self.ask(w, PromptKind::OpenUrl(url.clone()), "Open this link?".into(), url, None);
         }
     }
 
@@ -811,14 +936,15 @@ impl Core {
                 if let Some(i) = self.tab_index(id) {
                     if let Some(f) = Frame::take(self.tabs[i].surface) {
                         let gpu = f.dmabuf().is_some();
-                        // GPU frames wanted but CPU frames keep coming: the
-                        // driver can't export (e.g. software rendering).
-                        let wanted = self.gpu_backend && self.prompt.is_none() && self.search.is_none();
-                        self.gpu_misses = if wanted && !gpu { self.gpu_misses + 1 } else { 0 };
+                        // This tab was asked for GPU frames but CPU frames
+                        // keep coming: the driver can't export (e.g. software
+                        // rendering). Judged by what the tab was actually
+                        // asked for: modes switch lazily (at the next draw),
+                        // so CPU frames right after a switch aren't failures.
+                        let asked = self.gpu_backend && self.tabs[i].gpu();
+                        self.gpu_misses = if asked && !gpu { self.gpu_misses + 1 } else { 0 };
                         if self.gpu_misses >= 8 {
-                            eprintln!("ghostdrop: GPU frames unavailable (DMA-BUF export failed); using CPU frames");
-                            self.gpu_misses = 0;
-                            self.set_gpu_backend(false);
+                            self.gpu_failed(w, "DMA-BUF export failed");
                         }
                         let was_gpu = self.tabs[i].frame.as_ref().is_some_and(|p| p.dmabuf().is_some());
                         self.tabs[i].frame = Some(f);
@@ -964,17 +1090,8 @@ impl Core {
             }
             GEvent::CloseSurface(id, needs_confirm) => {
                 if needs_confirm && self.tab_index(id).is_some() {
-                    self.ensure_visible(w);
-                    if let Some(i) = self.tab_index(id) {
-                        self.select(w, i);
-                    }
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::CloseTab(id),
-                        title: "Close this tab?".into(),
-                        detail: "A process is still running in this tab.".into(),
-                        input: None,
-                    });
-                    w.request_redraw();
+                    let detail = "A process is still running in this tab.".to_string();
+                    self.ask(w, PromptKind::CloseTab(id), "Close this tab?".into(), detail, None);
                 } else {
                     self.close_tab_now(w, id);
                 }
@@ -992,25 +1109,12 @@ impl Core {
                 } else {
                     "Allow a program to read your clipboard?"
                 };
-                self.ensure_visible(w);
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::ClipConfirm { sid, text: text.clone(), state },
-                    title: title.into(),
-                    detail: text,
-                    input: None,
-                });
-                w.request_redraw();
+                self.ask(w, PromptKind::ClipConfirm { sid, text: text.clone(), state }, title.into(), text, None);
             }
             GEvent::ClipWrite { clip, text, confirm } => {
                 if confirm {
-                    self.ensure_visible(w);
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::ClipWrite { clip, text: text.clone() },
-                        title: "Allow a program to set your clipboard?".into(),
-                        detail: text,
-                        input: None,
-                    });
-                    w.request_redraw();
+                    let title = "Allow a program to set your clipboard?".to_string();
+                    self.ask(w, PromptKind::ClipWrite { clip, text: text.clone() }, title, text, None);
                 } else {
                     w.set_clipboard(clip, text);
                 }
@@ -1045,27 +1149,71 @@ impl Core {
         if std::env::var_os("GHOSTDROP_TRACE_KEYS").is_some() {
             eprintln!("key {:?} kc={} sym={:#x} unshifted={:#x} text={:?} mods={:#x} consumed={:#x} focused={}", k.state, k.keycode, k.sym, k.unshifted, k.text, k.ghostty_mods, k.consumed, w.is_focused());
         }
-        if k.state == KeyState::Release && self.swallow.remove(&k.keycode) {
-            return;
-        }
-        if self.prompt.is_some() {
-            if k.state != KeyState::Release {
-                self.prompt_key(w, &k);
+        // Repeats and releases go wherever the press went.
+        let pressed_to = match k.state {
+            KeyState::Press => None,
+            KeyState::Repeat => self.keys_down.get(&k.keycode).copied(),
+            KeyState::Release => self.keys_down.remove(&k.keycode),
+        };
+        match (k.state, pressed_to) {
+            (KeyState::Release, Some(KeyTarget::Ui)) => {}
+            // Even if a prompt opened since: the terminal saw the press.
+            (KeyState::Release, Some(KeyTarget::Terminal(id))) => self.send_key(w, id, &k),
+            // Held keys keep editing the prompt or search field, nothing else.
+            (KeyState::Repeat, Some(KeyTarget::Ui)) => {
+                if self.prompt.is_some() {
+                    self.prompt_key(w, &k);
+                } else if self.search.is_some() {
+                    self.search_key(w, &k);
+                }
             }
-            return;
+            (KeyState::Repeat, Some(KeyTarget::Terminal(id))) => {
+                if self.prompt.is_none() {
+                    self.send_key(w, id, &k);
+                }
+            }
+            // Pressed before we had focus: the terminal tracks modifiers
+            // from releases too, unless a prompt is up.
+            (KeyState::Release, None) => {
+                if let Some(id) = self.selected_tab().map(|t| t.id).filter(|_| self.prompt.is_none()) {
+                    self.send_key(w, id, &k);
+                }
+            }
+            // A press (or a repeat whose press we never saw): route it.
+            (KeyState::Press, _) | (KeyState::Repeat, None) => {
+                let to = self.route_key(w, &k);
+                self.keys_down.insert(k.keycode, to);
+            }
         }
-        if self.search.is_some() && k.state != KeyState::Release && self.search_key(w, &k) {
-            return;
+    }
+
+    /// Decide who gets a new key press and deliver it.
+    fn route_key(&mut self, w: &mut dyn Window, k: &KeyInput) -> KeyTarget {
+        if self.prompt.is_some() {
+            self.prompt_key(w, k);
+            return KeyTarget::Ui;
+        }
+        if self.search.is_some() && self.search_key(w, k) {
+            return KeyTarget::Ui;
         }
         if k.state == KeyState::Press {
             let action = self.settings.bindings.iter().find(|(c, _)| c.matches(k.mods, k.unshifted)).map(|(_, a)| a.clone());
             if let Some(a) = action {
-                self.swallow.insert(k.keycode);
                 self.perform(w, &a);
-                return;
+                return KeyTarget::Ui;
             }
         }
-        let Some(tab) = self.selected_tab() else { return };
+        match self.selected_tab().map(|t| t.id) {
+            Some(id) => {
+                self.send_key(w, id, k);
+                KeyTarget::Terminal(id)
+            }
+            None => KeyTarget::Ui,
+        }
+    }
+
+    fn send_key(&mut self, w: &mut dyn Window, id: SurfaceId, k: &KeyInput) {
+        let Some(i) = self.tab_index(id) else { return };
         let action = match k.state {
             KeyState::Press => GHOSTTY_ACTION_PRESS,
             KeyState::Repeat => GHOSTTY_ACTION_REPEAT,
@@ -1084,16 +1232,20 @@ impl Core {
             unshifted_codepoint: unshifted,
             composing: k.composing,
         };
-        unsafe { ghostty_surface_key(tab.surface, ev) };
+        unsafe { ghostty_surface_key(self.tabs[i].surface, ev) };
         self.process(w);
     }
 
     fn prompt_key(&mut self, w: &mut dyn Window, k: &KeyInput) {
         use xkbcommon::xkb::keysyms as ks;
         let editing = self.prompt.as_ref().is_some_and(|p| p.input.is_some());
+        // Only a fresh press answers: a held Enter must not also answer the
+        // question queued behind this one.
+        let answer = k.state == KeyState::Press;
         match k.sym {
-            ks::KEY_Return | ks::KEY_KP_Enter => self.prompt_answer(w, true),
-            ks::KEY_Escape => self.prompt_answer(w, false),
+            ks::KEY_Return | ks::KEY_KP_Enter if answer => self.prompt_answer(w, true),
+            ks::KEY_Escape if answer => self.prompt_answer(w, false),
+            ks::KEY_Return | ks::KEY_KP_Enter | ks::KEY_Escape => {}
             ks::KEY_BackSpace if editing => {
                 if let Some(s) = self.prompt.as_mut().and_then(|p| p.input.as_mut()) {
                     s.pop();
@@ -1106,6 +1258,7 @@ impl Core {
                     }
                 }
             }
+            _ if !answer => {}
             _ => match k.text.as_str() {
                 "y" | "Y" => self.prompt_answer(w, true),
                 "n" | "N" => self.prompt_answer(w, false),
@@ -1117,6 +1270,7 @@ impl Core {
 
     fn prompt_answer(&mut self, w: &mut dyn Window, yes: bool) {
         let Some(p) = self.prompt.take() else { return };
+        self.prompt = self.prompts.pop_front();
         match p.kind {
             PromptKind::CloseTab(id) => {
                 if yes {
@@ -1158,6 +1312,7 @@ impl Core {
                 }
             }
         }
+        self.show_prompt_tab(w);
         self.process(w);
         w.request_redraw();
     }
@@ -1202,7 +1357,8 @@ impl Core {
 
     fn update_cursor(&mut self, w: &mut dyn Window) {
         let (x, y) = self.mouse;
-        let want = if self.in_tab_bar(w, x, y) { Cursor::Default } else { self.term_cursor };
+        let terminal_drag = matches!(self.capture, Capture::Terminal { .. });
+        let want = if self.in_tab_bar(w, x, y) && !terminal_drag { Cursor::Default } else { self.term_cursor };
         if self.cursor_shown != Some(want) {
             self.cursor_shown = Some(want);
             w.set_cursor(want);
@@ -1245,9 +1401,25 @@ impl Core {
         (x, y - top)
     }
 
+    fn surface_of(&self, id: SurfaceId) -> Option<ghostty_surface_t> {
+        self.tab_index(id).map(|i| self.tabs[i].surface)
+    }
+
+    /// End a capture without its release (we're hiding, so it won't come):
+    /// the terminal is told the buttons went up, or it keeps selecting.
+    fn release_capture(&mut self) {
+        if let Capture::Terminal { id, held } = std::mem::replace(&mut self.capture, Capture::None) {
+            if let Some(s) = self.surface_of(id) {
+                for code in (0..32u32).filter(|c| held & (1 << c) != 0) {
+                    unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_RELEASE, code as _, 0 as _) };
+                }
+            }
+        }
+    }
+
     pub fn pointer(&mut self, w: &mut dyn Window, ev: PointerInput, mods: Mods) {
         if !matches!(ev, PointerInput::Motion { .. }) {
-            trace!("pointer {ev:?}");
+            trace!("pointer {ev:?} capture={:?}", self.capture);
         }
         let gm = (if mods.shift { GHOSTTY_MODS_SHIFT as u32 } else { 0 })
             | (if mods.ctrl { GHOSTTY_MODS_CTRL as u32 } else { 0 })
@@ -1257,25 +1429,48 @@ impl Core {
         match ev {
             PointerInput::Motion { x, y } => {
                 self.mouse = (x, y);
-                if self.in_tab_bar(w, x, y) {
-                    let h = self.bar_hit(w, x);
-                    if h != self.hover {
-                        self.hover = h;
-                        w.request_redraw();
-                    }
-                    if let (Some((from, sx)), Some(Hover::Tab(to, _))) = (self.pressed_in_bar, h) {
-                        if (x - sx).abs() > 8.0 && to != from {
-                            self.move_tab_to(w, from, to);
-                            self.pressed_in_bar = Some((to, x));
+                let in_bar = self.in_tab_bar(w, x, y);
+                match self.capture {
+                    // Selecting/dragging in a terminal: it follows the pointer
+                    // anywhere, tab bar and outside the window included.
+                    Capture::Terminal { id, .. } => {
+                        if self.hover.take().is_some() {
+                            w.request_redraw();
+                        }
+                        if let Some(s) = self.surface_of(id) {
+                            let (tx, ty) = self.term_pos(w, x, y);
+                            unsafe { ghostty_surface_mouse_pos(s, tx, ty, gm as _) };
                         }
                     }
-                } else {
-                    if self.hover.take().is_some() {
-                        w.request_redraw();
+                    _ if in_bar => {
+                        let h = self.bar_hit(w, x);
+                        if h != self.hover {
+                            self.hover = h;
+                            w.request_redraw();
+                        }
+                        if let (Capture::Bar { drag: Some((id, sx)), .. }, Some(Hover::Tab(to, _))) = (self.capture, h) {
+                            if let Some(from) = self.tab_index(id).filter(|from| *from != to && (x - sx).abs() > 8.0) {
+                                self.move_tab_to(w, from, to);
+                                if let Capture::Bar { drag, .. } = &mut self.capture {
+                                    *drag = Some((id, x));
+                                }
+                            }
+                        }
                     }
-                    if let Some(s) = surface {
-                        let (tx, ty) = self.term_pos(w, x, y);
-                        unsafe { ghostty_surface_mouse_pos(s, tx, ty, gm as _) };
+                    // A tab-bar button is held: the terminal isn't involved.
+                    Capture::Bar { .. } => {
+                        if self.hover.take().is_some() {
+                            w.request_redraw();
+                        }
+                    }
+                    Capture::None => {
+                        if self.hover.take().is_some() {
+                            w.request_redraw();
+                        }
+                        if let Some(s) = surface {
+                            let (tx, ty) = self.term_pos(w, x, y);
+                            unsafe { ghostty_surface_mouse_pos(s, tx, ty, gm as _) };
+                        }
                     }
                 }
                 self.update_cursor(w);
@@ -1285,40 +1480,72 @@ impl Core {
                 if self.hover.take().is_some() {
                     w.request_redraw();
                 }
-                if let Some(s) = surface {
-                    unsafe { ghostty_surface_mouse_pos(s, -1.0, -1.0, gm as _) };
+                // While a button is held the pointer is still ours (the
+                // release comes to us); don't cut a selection drag short.
+                if !matches!(self.capture, Capture::Terminal { .. }) {
+                    if let Some(s) = surface {
+                        unsafe { ghostty_surface_mouse_pos(s, -1.0, -1.0, gm as _) };
+                    }
                 }
             }
-            PointerInput::Button { button, pressed } => {
-                let (x, y) = self.mouse;
+            PointerInput::Button { button, pressed: false } => match self.capture {
+                Capture::Terminal { id, held } if held & button_bit(button) != 0 => {
+                    if let Some(s) = self.surface_of(id) {
+                        unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_RELEASE, ghostty_button(button), gm as _) };
+                    }
+                    let held = held & !button_bit(button);
+                    self.capture = if held == 0 { Capture::None } else { Capture::Terminal { id, held } };
+                    self.update_cursor(w);
+                }
+                Capture::Bar { button: b, .. } if b == button => self.capture = Capture::None,
+                // We never saw (or forwarded) the press.
+                _ => {}
+            },
+            PointerInput::Button { button, pressed: true } => {
                 if self.prompt.is_some() {
                     return;
                 }
-                if self.in_tab_bar(w, x, y) {
-                    if pressed {
-                        self.bar_click(w, button, x);
-                    } else {
-                        self.pressed_in_bar = None;
+                let (x, y) = self.mouse;
+                match self.capture {
+                    // More buttons during a terminal drag go to that terminal.
+                    Capture::Terminal { id, held } => {
+                        if let Some(s) = self.surface_of(id) {
+                            unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_PRESS, ghostty_button(button), gm as _) };
+                        }
+                        self.capture = Capture::Terminal { id, held: held | button_bit(button) };
                     }
-                } else if let Some(s) = surface {
-                    let state = if pressed { GHOSTTY_MOUSE_PRESS } else { GHOSTTY_MOUSE_RELEASE };
-                    unsafe { ghostty_surface_mouse_button(s, state, ghostty_button(button), gm as _) };
+                    Capture::Bar { .. } => {}
+                    Capture::None if self.in_tab_bar(w, x, y) => {
+                        self.capture = Capture::Bar { button, drag: None };
+                        self.bar_click(w, button, x);
+                    }
+                    Capture::None => {
+                        if let Some(t) = self.selected_tab() {
+                            let (id, s) = (t.id, t.surface);
+                            self.capture = Capture::Terminal { id, held: button_bit(button) };
+                            unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_PRESS, ghostty_button(button), gm as _) };
+                        }
+                    }
                 }
             }
             PointerInput::Scroll { dx, dy, precise } => {
-                if let Some(s) = surface {
-                    let (x, y) = self.mouse;
-                    if !self.in_tab_bar(w, x, y) {
-                        // Wayland/X11 report positive = down/right; Ghostty wants
-                        // positive = up/left (same inversion as its GTK app).
-                        unsafe { ghostty_surface_mouse_scroll(s, -dx, -dy, precise as i32) };
-                    }
+                let (x, y) = self.mouse;
+                let target = match self.capture {
+                    Capture::Terminal { id, .. } => self.surface_of(id),
+                    Capture::Bar { .. } => None,
+                    Capture::None => surface.filter(|_| !self.in_tab_bar(w, x, y)),
+                };
+                if let Some(s) = target {
+                    // Wayland/X11 report positive = down/right; Ghostty wants
+                    // positive = up/left (same inversion as its GTK app).
+                    unsafe { ghostty_surface_mouse_scroll(s, -dx, -dy, precise as i32) };
                 }
             }
         }
         self.process(w);
     }
 
+    /// A button went down on the tab bar (the capture is already `Bar`).
     fn bar_click(&mut self, w: &mut dyn Window, button: Button, x: f64) {
         match (self.bar_hit(w, x), button) {
             (Some(Hover::Plus), Button::Left) => self.perform(w, &Action::NewTab(None)),
@@ -1330,7 +1557,10 @@ impl Core {
             }
             (Some(Hover::Tab(i, false)), Button::Left) => {
                 self.select(w, i);
-                self.pressed_in_bar = Some((i, x));
+                let id = self.tabs.get(i).map(|t| t.id);
+                if let (Capture::Bar { drag, .. }, Some(id)) = (&mut self.capture, id) {
+                    *drag = Some((id, x));
+                }
             }
             (None, Button::Left) => {
                 let now = Instant::now();
@@ -1627,7 +1857,7 @@ impl Core {
             .collect();
         let (ww, wh) = w.size();
         format!(
-            "{{\"backend\":\"{}\",\"gpu\":{},\"visible\":{},\"focused\":{},\"size\":[{},{}],\"scale\":{},\"selected\":{},\"tabBar\":{},\"hotkey\":\"{}\",\"prompt\":\"{}\",\"search\":\"{}\",\"errors\":[{}],\"tabs\":[{}],\"screen\":\"{}\"}}",
+            "{{\"backend\":\"{}\",\"gpu\":{},\"visible\":{},\"focused\":{},\"size\":[{},{}],\"scale\":{},\"selected\":{},\"tabBar\":{},\"hotkey\":\"{}\",\"prompt\":\"{}\",\"promptsQueued\":{},\"search\":\"{}\",\"errors\":[{}],\"tabs\":[{}],\"screen\":\"{}\"}}",
             w.backend_name(),
             self.gpu_backend,
             w.is_visible(),
@@ -1639,6 +1869,7 @@ impl Core {
             self.tab_bar_visible(),
             esc(&w.hotkey_status()),
             esc(&self.prompt.as_ref().map_or(String::new(), |p| p.title.clone())),
+            self.prompts.len(),
             esc(&self.search.as_ref().map_or(String::new(), |s| format!("{} [{}/{}]", s.needle, s.selected, s.total))),
             self.settings.errors.iter().map(|e| format!("\"{}\"", esc(e))).collect::<Vec<_>>().join(","),
             tabs.join(","),

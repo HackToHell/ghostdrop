@@ -163,16 +163,14 @@ pub struct WlWin {
     needs_redraw: bool,
     serial: u32,
     clip_results: Vec<(u64, Option<String>)>,
-    /// Mapped with exclusive keyboard interactivity to get focus right away;
-    /// relaxed to on-demand once focus arrives (so clicking away works).
-    relax_keyboard: bool,
-    /// When we last switched Exclusive -> OnDemand.
-    relaxed_at: Option<Instant>,
+    /// Keyboard interactivity of the mapped layer surface.
+    kbd: Kbd,
     /// The compositor drops focus from on-demand layer surfaces (sway 1.12
-    /// does so on every layer re-arrange), so stay exclusive.
+    /// does so on every layer re-arrange), so stay exclusive. Learned at
+    /// runtime, the first time focus vanishes right after relaxing.
     ondemand_broken: bool,
-    /// Keyboard interactivity currently committed.
-    exclusive_now: std::cell::Cell<bool>,
+    /// `quick-terminal-keyboard-interactivity = exclusive` at the last show.
+    exclusive_cfg: bool,
     /// Last keyboard leave (for focus-flicker detection).
     kb_left_at: Option<Instant>,
     pointer_inside: bool,
@@ -183,6 +181,26 @@ pub struct WlState {
     pub win: WlWin,
     pub core: Core,
 }
+
+/// Keyboard interactivity. Layer surfaces can't ask for focus, so we map (and
+/// re-focus) with Exclusive, which makes the compositor give it to us, and
+/// relax to OnDemand once it arrives so clicking another window takes it away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kbd {
+    /// Exclusive until keyboard focus arrives, then OnDemand.
+    Claiming,
+    /// OnDemand. `relaxed_at`: just relaxed from Claiming; losing focus right
+    /// away means this compositor drops on-demand focus.
+    OnDemand { relaxed_at: Option<Instant> },
+    /// Exclusive for good: configured, or on-demand doesn't work here.
+    Exclusive,
+}
+
+/// Focus lost this soon after relaxing to on-demand means the compositor
+/// drops on-demand focus. (Waiting for a second drop to rule out a quick
+/// click elsewhere gives sway's focus-follows-mouse a mapping in which
+/// hovering another window hides the drop-down.)
+const ONDEMAND_PROBATION: Duration = Duration::from_millis(150);
 
 /// Our own wl_keyboard handler (we need xkb's consumed modifiers, which
 /// SCTK's keyboard helper doesn't expose).
@@ -248,14 +266,28 @@ impl WlWin {
         layer.set_anchor(anchor);
         layer.set_size(size.0.round() as u32, size.1.round() as u32);
         layer.set_exclusive_zone(0);
-        // Exclusive until we have focus (see `relax_keyboard`).
-        let exclusive = p.exclusive_keyboard || self.ondemand_broken || !self.kb_focus;
-        self.exclusive_now.set(exclusive);
-        layer.set_keyboard_interactivity(if exclusive {
-            KeyboardInteractivity::Exclusive
-        } else {
-            KeyboardInteractivity::OnDemand
-        });
+        layer.set_keyboard_interactivity(self.interactivity());
+    }
+
+    fn interactivity(&self) -> KeyboardInteractivity {
+        match self.kbd {
+            Kbd::OnDemand { .. } => KeyboardInteractivity::OnDemand,
+            Kbd::Claiming | Kbd::Exclusive => KeyboardInteractivity::Exclusive,
+        }
+    }
+
+    /// Keyboard state for a placement: exclusive if configured (or on-demand
+    /// is broken here); otherwise keep what we have. Re-placing a visible
+    /// window (reload, fullscreen) must not grab focus from another window.
+    fn kbd_for(&self, p: &Placement) -> Kbd {
+        if p.exclusive_keyboard || self.ondemand_broken {
+            return Kbd::Exclusive;
+        }
+        match self.kbd {
+            // It was exclusive only because the config said so.
+            Kbd::Exclusive if self.exclusive_cfg => Kbd::OnDemand { relaxed_at: None },
+            k => k,
+        }
     }
 
     /// Put the GPU subsurface over the terminal (`rect`, physical px) or
@@ -353,15 +385,6 @@ impl WlWin {
         Ok(true)
     }
 
-    fn disable_gpu(&mut self, why: &str) {
-        if let Some(mut g) = self.gpu.take() {
-            eprintln!("ghostdrop: GPU presentation off ({why}); using CPU frames");
-            g.drop_surface();
-        }
-        self.needs_present = false;
-        self.needs_redraw = true;
-    }
-
     fn stop_repeat(&mut self) {
         self.repeat_key = None;
         if let Some(t) = self.repeat_token.take() {
@@ -377,10 +400,20 @@ impl WlWin {
 impl Window for WlWin {
     fn show(&mut self, p: &Placement) {
         if let Some(layer) = self.layer.as_ref() {
+            if self.probe.is_some() {
+                // Still sizing for the output: the probe's configure applies
+                // the latest placement.
+                self.probe = Some(*p);
+                return;
+            }
+            self.kbd = self.kbd_for(p);
+            self.exclusive_cfg = p.exclusive_keyboard;
             self.configure_layer(layer, p);
             layer.commit();
             return;
         }
+        self.kbd = if p.exclusive_keyboard || self.ondemand_broken { Kbd::Exclusive } else { Kbd::Claiming };
+        self.exclusive_cfg = p.exclusive_keyboard;
         let surface = self.compositor.create_surface(&self.qh);
         if let (Some(m), Some(v)) = (self.frac_mgr.as_ref(), self.viewporter.as_ref()) {
             self.frac = Some(m.get_fractional_scale(&surface, &self.qh, FracData));
@@ -403,8 +436,6 @@ impl Window for WlWin {
         }
         layer.commit();
         self.layer = Some(layer);
-        self.relax_keyboard = !p.exclusive_keyboard && !self.ondemand_broken;
-        self.relaxed_at = None;
         self.kb_left_at = None;
         self.visible = true;
         self.configured = false;
@@ -430,8 +461,7 @@ impl Window for WlWin {
         self.kb_focus = false;
         self.frame_pending = false;
         self.pointer_inside = false;
-        self.relax_keyboard = false;
-        self.relaxed_at = None;
+        self.kbd = Kbd::Claiming;
         self.kb_left_at = None;
         self.probe = None;
         self.known_output = None;
@@ -443,6 +473,29 @@ impl Window for WlWin {
 
     fn is_focused(&self) -> bool {
         self.kb_focus
+    }
+
+    fn focus(&mut self) {
+        if self.kb_focus {
+            return;
+        }
+        let Some(layer) = self.layer.as_ref() else { return };
+        // Exclusive makes the compositor hand us the keyboard; Claiming
+        // relaxes back to on-demand once it does.
+        if self.kbd != Kbd::Exclusive {
+            self.kbd = Kbd::Claiming;
+        }
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+    }
+
+    fn disable_gpu(&mut self, why: &str) {
+        if let Some(mut g) = self.gpu.take() {
+            eprintln!("ghostdrop: GPU presentation off ({why}); using CPU frames");
+            g.drop_surface();
+        }
+        self.needs_present = false;
+        self.needs_redraw = true;
     }
 
     fn scale(&self) -> f64 {
@@ -609,10 +662,7 @@ impl WlState {
             Some((frame, rect)) => match w.present_gpu(frame, rect) {
                 Ok(true) => w.needs_present = false,
                 Ok(false) => {}
-                Err(e) => {
-                    w.disable_gpu(&e);
-                    self.core.set_gpu_backend(false);
-                }
+                Err(e) => self.core.gpu_failed(w, &e),
             },
         }
     }
@@ -753,10 +803,9 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         needs_redraw: false,
         serial: 0,
         clip_results: Vec::new(),
-        relax_keyboard: false,
-        relaxed_at: None,
+        kbd: Kbd::Claiming,
         ondemand_broken: false,
-        exclusive_now: std::cell::Cell::new(false),
+        exclusive_cfg: false,
         kb_left_at: None,
         pointer_inside: false,
         pointer_left_at: None,
@@ -840,6 +889,8 @@ impl LayerShellHandler for WlState {
             if w > 0 && h > 0 {
                 self.win.known_output = Some((w as f64, h as f64));
             }
+            self.win.kbd = self.win.kbd_for(&p);
+            self.win.exclusive_cfg = p.exclusive_keyboard;
             if let Some(layer) = self.win.layer.as_ref() {
                 self.win.configure_layer(layer, &p);
                 layer.commit();
@@ -929,13 +980,11 @@ impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
                 }
                 st.win.serial = serial;
                 st.win.kb_focus = true;
-                if st.win.relax_keyboard {
-                    st.win.relax_keyboard = false;
+                if st.win.kbd == Kbd::Claiming {
                     if let Some(l) = st.win.layer.as_ref() {
                         l.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
                         l.commit();
-                        st.win.exclusive_now.set(false);
-                        st.win.relaxed_at = Some(Instant::now());
+                        st.win.kbd = Kbd::OnDemand { relaxed_at: Some(Instant::now()) };
                     }
                 }
                 // With an exclusive layer, sway answers a click on another
@@ -946,7 +995,7 @@ impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
                 let outside = !st.win.pointer_inside
                     && st.win.pointer_left_at.is_none_or(|t| t.elapsed() > Duration::from_millis(150));
                 st.core.focus_changed(&mut st.win, true);
-                if flicker && outside && st.win.exclusive_now.get() && st.win.visible {
+                if flicker && outside && st.win.kbd == Kbd::Exclusive && st.win.visible {
                     st.core.outside_click(&mut st.win);
                 }
             }
@@ -958,17 +1007,21 @@ impl Dispatch2<wl_keyboard::WlKeyboard, WlState> for KbData {
                 st.win.kb_focus = false;
                 st.win.kb_left_at = Some(Instant::now());
                 st.win.stop_repeat();
-                if st.win.relaxed_at.take().is_some_and(|t| t.elapsed() < Duration::from_millis(150)) {
-                    // Focus vanished right after going on-demand: this
-                    // compositor won't keep it. Go back to exclusive for good;
-                    // the focus-loss debounce hides the bounce.
-                    crate::core::trace!("compositor drops on-demand focus; staying exclusive");
-                    st.win.ondemand_broken = true;
-                    st.win.kb_left_at = None;
-                    if let Some(l) = st.win.layer.as_ref() {
-                        l.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-                        l.commit();
-                        st.win.exclusive_now.set(true);
+                if let Kbd::OnDemand { relaxed_at: Some(t) } = st.win.kbd {
+                    if t.elapsed() < ONDEMAND_PROBATION {
+                        // Focus vanished right after going on-demand: this
+                        // compositor won't keep it. Go back to exclusive for
+                        // good; the focus-loss debounce hides the bounce.
+                        crate::core::trace!("compositor drops on-demand focus; staying exclusive");
+                        st.win.ondemand_broken = true;
+                        st.win.kbd = Kbd::Exclusive;
+                        st.win.kb_left_at = None;
+                        if let Some(l) = st.win.layer.as_ref() {
+                            l.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+                            l.commit();
+                        }
+                    } else {
+                        st.win.kbd = Kbd::OnDemand { relaxed_at: None };
                     }
                 }
                 if let Some(x) = st.win.xkb.as_mut() {
@@ -1225,8 +1278,7 @@ impl DmabufHandler for WlState {
 
     fn failed(&mut self, _: &Connection, _: &QueueHandle<Self>, params: &ZwpLinuxBufferParamsV1) {
         params.destroy();
-        self.win.disable_gpu("the compositor could not import a frame");
-        self.core.set_gpu_backend(false);
+        self.core.gpu_failed(&mut self.win, "the compositor could not import a frame");
     }
 
     fn released(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlBuffer) {}

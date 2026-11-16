@@ -8,7 +8,7 @@ use crate::xkb::{KeyState, Xkb};
 use calloop::{generic::Generic, Interest, Mode, PostAction};
 use std::collections::{HashMap, HashSet};
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xkb::{self as xxkb, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
@@ -123,11 +123,28 @@ fn outside(w: u32, h: u32, (x, y, cw, ch): (u32, u32, u32, u32)) -> Vec<(u32, u3
         .collect()
 }
 
-struct IncrRead {
-    property: u32,
-    data: Vec<u8>,
+/// A read of one selection (CLIPBOARD or PRIMARY; each has its own property):
+/// ConvertSelection(UTF8_STRING) -> SelectionNotify, then maybe a retry as
+/// STRING, then maybe an INCR transfer, then done. Requests made meanwhile
+/// join it. Owners can hang or die mid-way, so every step has a deadline.
+struct SelRead {
     tokens: Vec<u64>,
+    phase: ReadPhase,
+    deadline: Instant,
 }
+
+enum ReadPhase {
+    /// Waiting for the SelectionNotify for this target.
+    Converting { target: u32 },
+    /// Large transfer: chunks arrive as PropertyNotify(NewValue); an empty
+    /// one ends it.
+    Incr { data: Vec<u8> },
+}
+
+/// How long a selection owner gets for each step of a read.
+const READ_STEP_TIMEOUT: Duration = Duration::from_secs(2);
+/// A lost ShmCompletion must not stall CPU redraws forever.
+const SHM_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct X11Win {
     conn: XCBConnection,
@@ -138,7 +155,8 @@ pub struct X11Win {
     atoms: Atoms,
     shm: Option<ShmBuf>,
     shm_supported: bool,
-    shm_busy: bool,
+    /// An SHM upload is in flight since then (until its ShmCompletion).
+    shm_busy: Option<Instant>,
     visible: bool,
     focused: bool,
     geom: (i32, i32, u32, u32),
@@ -154,9 +172,8 @@ pub struct X11Win {
     clip_text: String,
     primary_text: String,
     owns: HashSet<u32>,
-    reads: HashMap<u32, Vec<u64>>,
-    tried_string: HashSet<u32>,
-    incr: Option<IncrRead>,
+    /// Selection reads in flight, by selection atom.
+    reads: HashMap<u32, SelRead>,
     clip_results: Vec<(u64, Option<String>)>,
     cursor_handle: Option<x11rb::cursor::Handle>,
     cursors: HashMap<Cursor, u32>,
@@ -365,24 +382,53 @@ impl X11Win {
         let _ = self.conn.flush();
     }
 
+    /// Our property for reading `selection`.
+    fn read_property(&self, selection: u32) -> u32 {
+        if selection == self.atoms.CLIPBOARD { self.atoms.GHOSTDROP_CLIPBOARD } else { self.atoms.GHOSTDROP_PRIMARY }
+    }
+
+    fn convert(&mut self, selection: u32, target: u32) {
+        let prop = self.read_property(selection);
+        let _ = self.conn.convert_selection(self.win, selection, target, prop, x11rb::CURRENT_TIME);
+        let _ = self.conn.flush();
+    }
+
     fn finish_read(&mut self, selection: u32, text: Option<String>) {
-        for t in self.reads.remove(&selection).unwrap_or_default() {
+        for t in self.reads.remove(&selection).map(|r| r.tokens).unwrap_or_default() {
             self.clip_results.push((t, text.clone()));
         }
-        self.tried_string.remove(&selection);
+    }
+
+    /// Give up on reads whose owner stopped answering, so later reads of
+    /// that selection start afresh instead of waiting behind them forever.
+    fn expire_reads(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<u32> = self.reads.iter().filter(|(_, r)| now >= r.deadline).map(|(s, _)| *s).collect();
+        for sel in stale {
+            crate::core::trace!("clipboard: selection {sel} owner timed out");
+            self.finish_read(sel, None);
+        }
+    }
+
+    fn next_read_deadline(&self) -> Option<Instant> {
+        self.reads.values().map(|r| r.deadline).min()
     }
 
     fn on_selection_notify(&mut self, ev: &SelectionNotifyEvent) {
         let sel = ev.selection;
+        let utf8 = self.atoms.UTF8_STRING;
+        let Some(read) = self.reads.get_mut(&sel) else { return };
+        let ReadPhase::Converting { target } = read.phase else { return };
         if ev.property == x11rb::NONE {
             // Some clients only offer STRING.
-            if ev.target == self.atoms.UTF8_STRING && self.tried_string.insert(sel) {
-                let prop = if sel == self.atoms.CLIPBOARD { self.atoms.GHOSTDROP_CLIPBOARD } else { self.atoms.GHOSTDROP_PRIMARY };
-                let _ = self.conn.convert_selection(self.win, sel, u32::from(AtomEnum::STRING), prop, x11rb::CURRENT_TIME);
-                let _ = self.conn.flush();
-                return;
+            if target == utf8 {
+                let string = u32::from(AtomEnum::STRING);
+                read.phase = ReadPhase::Converting { target: string };
+                read.deadline = Instant::now() + READ_STEP_TIMEOUT;
+                self.convert(sel, string);
+            } else {
+                self.finish_read(sel, None);
             }
-            self.finish_read(sel, None);
             return;
         }
         let Ok(Ok(reply)) = self
@@ -394,9 +440,11 @@ impl X11Win {
             return;
         };
         if reply.type_ == self.atoms.INCR {
-            // Large transfer: chunks arrive as PropertyNotify(NewValue).
-            let tokens = self.reads.remove(&sel).unwrap_or_default();
-            self.incr = Some(IncrRead { property: ev.property, data: Vec::new(), tokens });
+            // Deleting the property (above) tells the owner to start.
+            if let Some(read) = self.reads.get_mut(&sel) {
+                read.phase = ReadPhase::Incr { data: Vec::new() };
+                read.deadline = Instant::now() + READ_STEP_TIMEOUT;
+            }
             let _ = self.conn.flush();
             return;
         }
@@ -405,27 +453,42 @@ impl X11Win {
     }
 
     fn on_property_notify(&mut self, ev: &PropertyNotifyEvent) {
-        let Some(incr) = self.incr.as_mut() else { return };
-        if ev.window != self.win || ev.atom != incr.property || ev.state != Property::NEW_VALUE {
+        if ev.window != self.win || ev.state != Property::NEW_VALUE {
+            return;
+        }
+        let sel = if ev.atom == self.atoms.GHOSTDROP_CLIPBOARD {
+            self.atoms.CLIPBOARD
+        } else if ev.atom == self.atoms.GHOSTDROP_PRIMARY {
+            self.atoms.PRIMARY
+        } else {
+            return;
+        };
+        // Before the SelectionNotify the owner's write isn't a chunk.
+        if !self.reads.get(&sel).is_some_and(|r| matches!(r.phase, ReadPhase::Incr { .. })) {
             return;
         }
         let Ok(Ok(reply)) = self
             .conn
-            .get_property(true, self.win, incr.property, AtomEnum::ANY, 0, u32::MAX / 4)
+            .get_property(true, self.win, ev.atom, AtomEnum::ANY, 0, u32::MAX / 4)
             .map(|c| c.reply())
         else {
+            self.finish_read(sel, None);
             return;
         };
-        if reply.value.is_empty() {
-            let incr = self.incr.take().unwrap();
-            let text = String::from_utf8_lossy(&incr.data).into_owned();
-            for t in incr.tokens {
-                self.clip_results.push((t, Some(text.clone())));
-            }
-        } else {
-            incr.data.extend_from_slice(&reply.value);
-        }
         let _ = self.conn.flush();
+        let Some(read) = self.reads.get_mut(&sel) else { return };
+        let ReadPhase::Incr { data } = &mut read.phase else { return };
+        if reply.value.is_empty() {
+            let text = String::from_utf8_lossy(data).into_owned();
+            self.finish_read(sel, Some(text));
+        } else {
+            data.extend_from_slice(&reply.value);
+            read.deadline = Instant::now() + READ_STEP_TIMEOUT;
+        }
+    }
+
+    fn shm_busy(&self) -> bool {
+        self.shm_busy.is_some_and(|t| t.elapsed() < SHM_TIMEOUT)
     }
 
     /// Compose the whole window into the CPU buffer (SHM or plain).
@@ -464,7 +527,7 @@ impl X11Win {
                     self.depth, ImageFormat::Z_PIXMAP.into(), i + 1 == n, seg, 0,
                 );
                 if r.is_ok() && i + 1 == n {
-                    self.shm_busy = true;
+                    self.shm_busy = Some(Instant::now());
                 }
             }
         } else {
@@ -564,16 +627,6 @@ impl X11Win {
         Ok(true)
     }
 
-    /// Stop using zero-copy presentation (import/present failed).
-    fn disable_gpu(&mut self, why: &str) {
-        if let Some(mut g) = self.gpu.take() {
-            eprintln!("ghostdrop: GPU presentation off ({why}); using CPU frames");
-            g.free_all(&self.conn);
-        }
-        self.needs_present = false;
-        self.needs_redraw = true;
-    }
-
     /// Another client holds the keyboard: a screen locker (or a menu).
     /// Showing then would put the terminal above the lock screen.
     fn keyboard_grabbed_elsewhere(&self) -> bool {
@@ -629,9 +682,6 @@ impl Window for X11Win {
         self.visible = true;
         self.needs_redraw = true;
         let _ = self.conn.flush();
-        if resized {
-            self.shm_busy = false;
-        }
     }
 
     fn hide(&mut self) {
@@ -665,6 +715,16 @@ impl Window for X11Win {
 
     fn is_focused(&self) -> bool {
         self.focused
+    }
+
+    /// Stop using zero-copy presentation (import/present failed).
+    fn disable_gpu(&mut self, why: &str) {
+        if let Some(mut g) = self.gpu.take() {
+            eprintln!("ghostdrop: GPU presentation off ({why}); using CPU frames");
+            g.free_all(&self.conn);
+        }
+        self.needs_present = false;
+        self.needs_redraw = true;
     }
 
     fn focus(&mut self) {
@@ -753,21 +813,27 @@ impl Window for X11Win {
     }
 
     fn read_clipboard(&mut self, clip: Clip, token: u64) {
-        let (sel, prop) = match clip {
-            Clip::Standard => (self.atoms.CLIPBOARD, self.atoms.GHOSTDROP_CLIPBOARD),
-            Clip::Primary => (self.atoms.PRIMARY, self.atoms.GHOSTDROP_PRIMARY),
+        let sel = match clip {
+            Clip::Standard => self.atoms.CLIPBOARD,
+            Clip::Primary => self.atoms.PRIMARY,
         };
         if self.owns.contains(&sel) {
             let t = if sel == self.atoms.CLIPBOARD { self.clip_text.clone() } else { self.primary_text.clone() };
             self.clip_results.push((token, Some(t)));
             return;
         }
-        let first = !self.reads.contains_key(&sel);
-        self.reads.entry(sel).or_default().push(token);
-        if first {
-            let _ = self.conn.convert_selection(self.win, sel, self.atoms.UTF8_STRING, prop, x11rb::CURRENT_TIME);
-            let _ = self.conn.flush();
+        // Join a read in flight (whatever its phase) rather than start a
+        // second one on the same property.
+        if let Some(read) = self.reads.get_mut(&sel) {
+            read.tokens.push(token);
+            return;
         }
+        let target = self.atoms.UTF8_STRING;
+        self.reads.insert(
+            sel,
+            SelRead { tokens: vec![token], phase: ReadPhase::Converting { target }, deadline: Instant::now() + READ_STEP_TIMEOUT },
+        );
+        self.convert(sel, target);
     }
 
     fn backend_name(&self) -> &'static str {
@@ -861,7 +927,7 @@ impl X11State {
                 w.needs_redraw = true;
             }
             Event::Expose(e) if e.count == 0 => w.needs_redraw = true,
-            Event::ShmCompletion(_) => w.shm_busy = false,
+            Event::ShmCompletion(_) => w.shm_busy = None,
             Event::SelectionRequest(e) => w.send_selection(&e),
             Event::SelectionNotify(e) => w.on_selection_notify(&e),
             Event::SelectionClear(e) => {
@@ -895,8 +961,7 @@ impl X11State {
             Event::Error(e) => {
                 let gpu_err = w.gpu.as_ref().is_some_and(|g| e.major_opcode == g.dri3_opcode || e.major_opcode == g.present_opcode);
                 if gpu_err {
-                    w.disable_gpu(&format!("{:?}", e.error_kind));
-                    self.core.set_gpu_backend(false);
+                    self.core.gpu_failed(w, &format!("{:?}", e.error_kind));
                 } else {
                     crate::core::trace!("X error {:?} (major {} minor {})", e.error_kind, e.major_opcode, e.minor_opcode);
                 }
@@ -926,6 +991,7 @@ impl X11State {
         if self.core.quit {
             return;
         }
+        self.win.expire_reads();
         let results = std::mem::take(&mut self.win.clip_results);
         for (t, text) in results {
             self.core.clipboard_result(&mut self.win, t, text);
@@ -939,7 +1005,7 @@ impl X11State {
             return;
         }
         let (size, scale) = ((w.geom.2, w.geom.3), w.scale);
-        if w.needs_redraw && !w.shm_busy {
+        if w.needs_redraw && !w.shm_busy() {
             let core = &mut self.core;
             if w.compose(|c| core.draw(size, scale, c)) {
                 // With a GPU frame, upload only what's around the terminal;
@@ -960,10 +1026,7 @@ impl X11State {
                 Some((frame, rect)) => match w.present_gpu(frame, rect) {
                     Ok(true) => w.needs_present = false,
                     Ok(false) => {}
-                    Err(e) => {
-                        w.disable_gpu(&e);
-                        self.core.set_gpu_backend(false);
-                    }
+                    Err(e) => self.core.gpu_failed(w, &e),
                 },
             }
         }
@@ -1091,7 +1154,7 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
             atoms,
             shm: None,
             shm_supported,
-            shm_busy: false,
+            shm_busy: None,
             visible: false,
             focused: false,
             geom: (0, 0, 800, 400),
@@ -1108,8 +1171,6 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
             primary_text: String::new(),
             owns: HashSet::new(),
             reads: HashMap::new(),
-            tried_string: HashSet::new(),
-            incr: None,
             clip_results: Vec::new(),
             cursor_handle,
             cursors: HashMap::new(),
@@ -1202,9 +1263,11 @@ pub fn run(core: Core, show_now: bool) -> Result<(), String> {
         st.core.show(&mut st.win);
     }
     while !st.core.quit {
-        let timeout = st
-            .core
-            .next_deadline()
+        let deadline = match (st.core.next_deadline(), st.win.next_read_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let timeout = deadline
             .map(|d| d.saturating_duration_since(std::time::Instant::now()))
             .unwrap_or(Duration::from_millis(500))
             .min(Duration::from_millis(500));

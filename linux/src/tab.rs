@@ -183,6 +183,11 @@ impl Tab {
         }
     }
 
+    /// Whether this tab currently asks for DMA-BUF frames.
+    pub fn gpu(&self) -> bool {
+        self.gpu.get()
+    }
+
     pub fn set_visible(&self, v: bool) {
         unsafe { ghostty_surface_set_occlusion(self.surface, v) }
     }
