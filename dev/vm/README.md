@@ -47,6 +47,8 @@ dev/vm/vm.sh sync && dev/vm/vm.sh ssh 'cd ~/ghostdrop && scripts/build-linux.sh'
 dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/setup.sh'   # once: helpers + ctrl+` bindings
 dev/vm/tests/suite.sh                  # end-to-end on i3 and sway over VNC (hotkey, typing,
                                        # clipboard both ways, tabs + tab bar, click-outside)
+dev/vm/tests/states.sh                 # input/prompt/focus state: drags and releases over the tab
+                                       # bar, queued prompts, unfocused hotkey, dead clipboard owner
 dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/profiles.sh'   # profile commands, TERM override
 dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/perf.sh sway'  # latency/throughput/CPU (or x11)
 dev/vm/vm.sh ssh 'bash ~/ghostdrop/dev/vm/tests/leak.sh'       # open/close 75 tabs, RSS + malloc in-use

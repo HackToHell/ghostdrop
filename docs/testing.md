@@ -42,6 +42,25 @@ below the drop-down:
 | hotkey shows again | ✅ | ✅ |
 | hotkey hides | ✅ | ✅ |
 
+`dev/vm/tests/states.sh` covers the input, prompt, focus and clipboard state (written
+when those became explicit state machines; the build before them fails 6 of its 11
+checks on i3):
+
+| Check | i3 (X11) | sway (Wayland) |
+|---|---|---|
+| a tab-bar press released over the terminal ends the drag (hovering doesn't move tabs) | ✅ | ✅ |
+| dragging a tab reorders | ✅ | ✅ |
+| a selection released over the tab bar completes (copy-on-select) | ✅ | ✅ |
+| closing two busy tabs at once asks twice, one at a time, each with its tab in front | ✅ | ✅ |
+| a held Enter answers only one queued question | ✅ | ✅ |
+| a reload doesn't take focus from another window | ✅ | n/a¹ |
+| the hotkey focuses a visible but unfocused drop-down, then hides it | ✅ | n/a¹ |
+| pasting works after the clipboard owner died mid-read | ✅ | — |
+
+¹ sway (and labwc, also wlroots) drop keyboard focus from a layer surface the moment
+it goes on-demand, so Ghostdrop stays exclusive there and keeps focus; the
+unfocused state isn't reachable on them.
+
 `dev/vm/tests/profiles.sh` checks that profile commands start and get their `TERM`:
 login shell, a plain command, a `term` override, an `/usr/bin/env` wrapper, and
 `sh -c` with `;`. All pass.

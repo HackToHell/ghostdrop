@@ -14,7 +14,8 @@ ok() { PASS=$((PASS + 1)); echo "  ✓ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ✗ $1  (got: $2)"; }
 expect() { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2"; }
 
-for be in "${@:-x11 wayland}"; do
+[ $# -gt 0 ] || set -- x11 wayland
+for be in "$@"; do
   if [ "$be" = x11 ]; then envf=x11_env; off=0; paste_cmd="xclip -o -selection clipboard"
     set_clip='setsid -f sh -c "printf %s \"echo pasted-ok > /tmp/suite-paste.txt\" | xclip -selection clipboard" >/dev/null 2>&1 </dev/null'
   else envf=sway_env; off=24; paste_cmd="wl-paste --no-newline"
