@@ -27,6 +27,8 @@ final class SurfaceView: NSView, NSTextInputClient {
     var backgroundColorOverride: NSColor? { didSet { owner?.surfaceBackgroundDidChange(self) } }
     private(set) var bellActive = false
     private var titleTimer: Timer?
+    /// At a password prompt: secure keyboard entry while this surface is focused.
+    private(set) var passwordInput = false
 
     var title: String {
         if let titleOverride, !titleOverride.isEmpty { return titleOverride }
@@ -88,6 +90,10 @@ final class SurfaceView: NSView, NSTextInputClient {
     /// Frees the libghostty surface (kills the child process). Idempotent.
     func destroy() {
         titleTimer?.invalidate()
+        if passwordInput {
+            passwordInput = false
+            SecureInput.shared.removeScoped(ObjectIdentifier(self))
+        }
         guard let s = surface else { return }
         surface = nil
         ghostty_surface_free(s)
@@ -127,6 +133,20 @@ final class SurfaceView: NSView, NSTextInputClient {
         _ = ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
     }
 
+    func setPasswordInput(_ mode: ghostty_action_secure_input_e) {
+        guard surface != nil else { return }
+        switch mode {
+        case GHOSTTY_SECURE_INPUT_ON: passwordInput = true
+        case GHOSTTY_SECURE_INPUT_OFF: passwordInput = false
+        default: passwordInput.toggle()
+        }
+        if passwordInput {
+            SecureInput.shared.setScoped(ObjectIdentifier(self), focused: focused)
+        } else {
+            SecureInput.shared.removeScoped(ObjectIdentifier(self))
+        }
+    }
+
     func setOcclusion(visible: Bool) {
         guard let surface else { return }
         ghostty_surface_set_occlusion(surface, visible)
@@ -139,6 +159,7 @@ final class SurfaceView: NSView, NSTextInputClient {
         focused = f
         if !f { suppressNextLeftMouseUp = false }
         ghostty_surface_set_focus(surface, f)
+        if passwordInput { SecureInput.shared.setScoped(ObjectIdentifier(self), focused: f) }
         if f { clearBell() }
     }
 

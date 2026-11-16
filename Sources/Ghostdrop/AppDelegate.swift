@@ -195,9 +195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         if settings.statusItem {
             if statusItem == nil {
                 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-                item.button?.image = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: "Ghostdrop")
-                    ?? NSImage(systemSymbolName: "terminal", accessibilityDescription: "Ghostdrop")
-                item.button?.image?.isTemplate = true
+                item.button?.image = localNetwork.status == .denied
+                    ? NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Ghostdrop")
+                    : Self.statusIcon
                 let menu = NSMenu()
                 menu.delegate = self
                 item.menu = menu
@@ -254,7 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     }
 
     private func localNetworkChanged(_ status: LocalNetworkCheck.Status) {
-        guard status == .denied else { return }
+        guard status == .denied else {
+            // Allowed again (after the user fixed it in System Settings).
+            statusItem?.button?.image = Self.statusIcon
+            return
+        }
         NSLog("ghostdrop: Local Network access is denied for Ghostdrop")
         statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Ghostdrop")
         // Explain once; afterwards the menu-bar item keeps a warning entry.
@@ -271,6 +275,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     }
 
     @objc private func openLocalNetworkSettings() { LocalNetworkCheck.openSettings() }
+
+    private static var statusIcon: NSImage? {
+        let image = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: "Ghostdrop")
+            ?? NSImage(systemSymbolName: "terminal", accessibilityDescription: "Ghostdrop")
+        image?.isTemplate = true
+        return image
+    }
 
     // MARK: - GhosttyRuntimeDelegate
 
@@ -309,13 +320,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
                 NSPasteboard.general.setString(t, forType: .string)
             }
         case .startSearch(let needle):
-            drop.startSearch(needle)
+            drop.startSearch(needle, in: surface)
         case .endSearch:
-            drop.closeSearch(notify: false)
+            drop.searchEnded(in: surface)
         case .searchTotal(let n):
-            drop.updateSearch(total: n)
+            drop.updateSearch(total: n, from: surface)
         case .searchSelected(let n):
-            drop.updateSearch(selected: n)
+            drop.updateSearch(selected: n, from: surface)
         }
         return true
     }

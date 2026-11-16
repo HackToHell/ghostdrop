@@ -351,7 +351,14 @@ final class GhosttyRuntime {
 
         case GHOSTTY_ACTION_SECURE_INPUT:
             let mode = action.action.secure_input
-            onMain { SecureInput.set(mode) }
+            if let view {
+                // ON/OFF come from password-prompt detection (opt-out via
+                // macos-auto-secure-input); TOGGLE is the user's keybinding.
+                guard mode == GHOSTTY_SECURE_INPUT_TOGGLE || rt.bool("macos-auto-secure-input", true) else { return true }
+                onMain { view.setPasswordInput(mode) }
+            } else {
+                onMain { SecureInput.shared.setGlobal(mode) }
+            }
             return true
 
         case GHOSTTY_ACTION_RENDERER_HEALTH:
@@ -709,19 +716,61 @@ enum Notifier {
 
 // MARK: - Secure input
 
-enum SecureInput {
-    private static var enabled = false
+/// Secure keyboard entry (EnableSecureEventInput) is global system state: while
+/// on, other apps can't see keystrokes, and it stays on while we're in the
+/// background. So it's only on while Ghostdrop is active AND it's wanted
+/// globally (app-level toggle) or by a focused surface at a password prompt.
+/// Surfaces leave the set when they go away, so a closed tab can't leave it on.
+final class SecureInput {
+    static let shared = SecureInput()
 
-    static func set(_ mode: ghostty_action_secure_input_e) {
-        let want: Bool
-        switch mode {
-        case GHOSTTY_SECURE_INPUT_ON: want = true
-        case GHOSTTY_SECURE_INPUT_OFF: want = false
-        default: want = !enabled
+    private var global = false
+    /// Surfaces at a password prompt, and whether each is focused.
+    private var scoped: [ObjectIdentifier: Bool] = [:]
+    private var appActive = NSApp.isActive
+    /// EnableSecureEventInput is in effect (balanced with Disable).
+    private(set) var enabled = false
+
+    private init() {
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.appActive = true
+            self?.apply()
         }
+        nc.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.appActive = false
+            self?.apply()
+        }
+    }
+
+    func setGlobal(_ mode: ghostty_action_secure_input_e) {
+        switch mode {
+        case GHOSTTY_SECURE_INPUT_ON: global = true
+        case GHOSTTY_SECURE_INPUT_OFF: global = false
+        default: global.toggle()
+        }
+        apply()
+    }
+
+    func setScoped(_ id: ObjectIdentifier, focused: Bool) {
+        scoped[id] = focused
+        apply()
+    }
+
+    func removeScoped(_ id: ObjectIdentifier) {
+        guard scoped.removeValue(forKey: id) != nil else { return }
+        apply()
+    }
+
+    private func apply() {
+        let want = appActive && (global || scoped.values.contains(true))
         guard want != enabled else { return }
-        enabled = want
-        if want { EnableSecureEventInput() } else { DisableSecureEventInput() }
+        let err = want ? EnableSecureEventInput() : DisableSecureEventInput()
+        if err == noErr {
+            enabled = want
+        } else {
+            NSLog("ghostdrop: secure input %@ failed (%d)", want ? "enable" : "disable", err)
+        }
     }
 }
 

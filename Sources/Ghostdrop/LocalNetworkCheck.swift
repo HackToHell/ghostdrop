@@ -13,18 +13,21 @@ final class LocalNetworkCheck {
 
     private(set) var status: Status = .unknown
     var onChange: ((Status) -> Void)?
+    /// The probe in flight (both nil when idle). Callbacks from an earlier
+    /// probe check they're still the current one before reporting.
     private var browser: NWBrowser?
     private var timer: Timer?
 
     static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")!
 
+    /// Probes again (restarting a probe in flight).
     func run(timeout: TimeInterval = 4) {
-        browser?.cancel()
+        stop()
         let params = NWParameters()
         params.includePeerToPeer = false
         let b = NWBrowser(for: .bonjour(type: "_ssh._tcp", domain: "local."), using: params)
-        b.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        b.stateUpdateHandler = { [weak self, weak b] state in
+            guard let self, let b, self.browser === b else { return }
             switch state {
             case .waiting(let error), .failed(let error):
                 if case .dns(let code) = error, code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied) {
@@ -34,22 +37,28 @@ final class LocalNetworkCheck {
                 break
             }
         }
-        b.browseResultsChangedHandler = { [weak self] results, _ in
-            if !results.isEmpty { self?.finish(.allowed) }
+        b.browseResultsChangedHandler = { [weak self, weak b] results, _ in
+            guard let self, let b, self.browser === b else { return }
+            if !results.isEmpty { self.finish(.allowed) }
         }
         browser = b
         b.start(queue: .main)
         // No denial within the timeout: assume allowed (or nothing to find).
-        timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            self?.finish(.allowed)
+        timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self, weak b] _ in
+            guard let self, let b, self.browser === b else { return }
+            self.finish(.allowed)
         }
     }
 
-    private func finish(_ s: Status) {
+    private func stop() {
         timer?.invalidate()
         timer = nil
         browser?.cancel()
         browser = nil
+    }
+
+    private func finish(_ s: Status) {
+        stop()
         guard s != status else { return }
         status = s
         onChange?(s)

@@ -81,8 +81,15 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     private let content: DropContentView
     private(set) var tabs: [SurfaceView] = []
     private(set) var selected = 0
-    private(set) var visible = false
-    private var animating = false
+
+    /// Show/hide lifecycle. Animation completions carry the generation they
+    /// were started with and are ignored once another show/hide has begun.
+    private enum Phase { case hidden, showing, shown, hiding }
+    private var phase = Phase.hidden
+    private var generation = 0
+    /// On screen or on its way there.
+    var visible: Bool { phase == .showing || phase == .shown }
+
     private var previousApp: NSRunningApplication?
     private var keyMonitor: Any?
     private var lastScreenFrame: NSRect?
@@ -92,7 +99,11 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     private var resizeStart: (edge: ResizeHandle.Edge, mouse: NSPoint, frame: NSRect)?
     private var handlesPosition: DropPosition?
 
-    // Search overlay.
+    /// Tabs whose close needs confirming; the first one is being asked.
+    private var closeConfirmations: [SurfaceView] = []
+
+    // Search overlay. `searchView` is the surface being searched (nil = closed).
+    private weak var searchView: SurfaceView?
     private let searchBar = NSView()
     private let searchField = NSSearchField()
     private let searchLabel = NSTextField(labelWithString: "")
@@ -307,7 +318,10 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func show() {
         guard !visible else { return focus() }
-        visible = true
+        phase = .showing
+        generation += 1
+        let gen = generation
+        deactivateAfterHide = false
         let t0 = CACurrentMediaTime()
         defer { Trace.log("show (main thread)", since: t0) }
 
@@ -329,6 +343,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             window.setFrame(target, display: true)
             window.alphaValue = 1
             window.level = .floating
+            phase = .shown
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             focus()
@@ -343,17 +358,16 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         NSApp.activate(ignoringOtherApps: true)
         focus()
 
-        animating = true
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().setFrame(target, display: true)
             window.animator().alphaValue = 1
         }, completionHandler: { [weak self] in
-            guard let self else { return }
+            // A hide (or another show) started since: this one is stale.
+            guard let self, self.generation == gen, self.phase == .showing else { return }
             Trace.log("show animation done", since: t0)
-            self.animating = false
-            guard self.visible else { return }
+            self.phase = .shown
             self.window.level = .floating
             self.applyAppearance()
             self.focus()
@@ -366,15 +380,20 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
-        if let v = selectedView, window.firstResponder !== v, searchBar.isHidden || window.firstResponder !== searchField.currentEditor() {
+        if let v = selectedView, window.firstResponder !== v, searchView == nil || window.firstResponder !== searchField.currentEditor() {
             window.makeFirstResponder(v)
         }
     }
 
     func hide(restoreFocus: Bool = true) {
         guard visible else { return }
-        visible = false
-        if window.attachedSheet != nil { window.endSheet(window.attachedSheet!) }
+        phase = .hiding
+        generation += 1
+        let gen = generation
+        // Hiding cancels the confirmations still waiting (their tabs stay
+        // open), so none of them pops the drop-down back up.
+        closeConfirmations.removeAll()
+        if let sheet = window.attachedSheet { window.endSheet(sheet) }
 
         if restoreFocus, let prev = previousApp, !prev.isTerminated {
             prev.activate(options: [])
@@ -392,22 +411,23 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             return
         }
         window.level = .popUpMenu
-        animating = true
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             window.animator().setFrame(hiddenFrame(for: window.frame, on: screen), display: true)
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            self?.animating = false
-            self?.finishHide()
+            // Shown again since: don't order the window out.
+            guard let self, self.generation == gen else { return }
+            self.finishHide()
         })
     }
 
     private var deactivateAfterHide = false
 
     private func finishHide() {
-        guard !visible else { return }
+        guard phase == .hiding else { return }
+        phase = .hidden
         window.orderOut(nil)
         updateOcclusion()
         if deactivateAfterHide {
@@ -427,7 +447,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func windowDidResignKey(_ notification: Notification) {
         syncFocus()
-        guard visible, !animating, window.attachedSheet == nil else { return }
+        guard phase == .shown, window.attachedSheet == nil else { return }
         guard runtime.bool("quick-terminal-autohide", true) else { return }
         // Focus went elsewhere on purpose: don't steal it back.
         hide(restoreFocus: false)
@@ -525,7 +545,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     }
 
     @objc private func screensChanged() {
-        guard visible, !animating else { return }
+        guard phase == .shown else { return }
         window.setFrame(targetFrame(on: window.screen ?? currentScreen()), display: true)
     }
 
@@ -589,8 +609,8 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         defer { Trace.log("select tab", since: t0) }
         guard tabs.indices.contains(index) else { return }
         let old = selectedView
-        if !searchBar.isHidden {
-            old?.bindingAction("end_search")
+        if let searched = searchView {
+            searched.bindingAction("end_search")
             closeSearch(notify: false)
         }
         selected = index
@@ -645,6 +665,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func close(_ view: SurfaceView) {
         guard let idx = tabs.firstIndex(where: { $0 === view }) else { return }
+        if view === searchView { closeSearch(notify: false) }
         tabs.remove(at: idx)
         view.removeFromSuperview()
         view.owner = nil
@@ -705,13 +726,35 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     // MARK: - SurfaceOwner
 
     func surfaceRequestedClose(_ view: SurfaceView, needsConfirm: Bool) {
-        guard needsConfirm else { return close(view) }
+        guard needsConfirm else {
+            // Not the one on screen: its answer comes back through the queue.
+            if let i = closeConfirmations.firstIndex(where: { $0 === view }), i > 0 {
+                closeConfirmations.remove(at: i)
+            }
+            return close(view)
+        }
+        // One question at a time, asked with its tab in front (closing
+        // several busy tabs at once would otherwise select the last one while
+        // the first question is on screen).
+        guard !closeConfirmations.contains(where: { $0 === view }) else { return }
+        closeConfirmations.append(view)
+        if closeConfirmations.count == 1 { confirmNextClose() }
+    }
+
+    private func confirmNextClose() {
+        closeConfirmations.removeAll { v in !tabs.contains { $0 === v } }
+        guard let view = closeConfirmations.first, let i = tabs.firstIndex(where: { $0 === view }) else { return }
         if !visible { show() }
-        if let i = tabs.firstIndex(where: { $0 === view }) { select(i) }
+        select(i)
         Alerts.confirm(in: window, title: "Close this tab?",
                        info: "A process is still running in this tab. Closing it will terminate the process.",
                        ok: "Close", remember: false) { [weak self] ok, _ in
-            if ok { self?.close(view) }
+            guard let self else { return }
+            // Cancelled by hide(): the queue is already empty.
+            guard self.closeConfirmations.first === view else { return }
+            self.closeConfirmations.removeFirst()
+            if ok { self.close(view) }
+            self.confirmNextClose()
         }
     }
 
@@ -789,7 +832,15 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         content.terminals.addSubview(searchBar)
     }
 
-    func startSearch(_ needle: String) {
+    func startSearch(_ needle: String, in view: SurfaceView?) {
+        guard let view = view ?? selectedView else { return }
+        if searchView !== view {
+            searchView?.bindingAction("end_search")
+            searchTotal = -1
+            searchSelected = -1
+            updateSearch()
+        }
+        searchView = view
         let b = content.terminals.bounds
         searchBar.frame.origin = NSPoint(x: b.maxX - searchBar.frame.width - 10, y: b.maxY - searchBar.frame.height - 10)
         searchBar.isHidden = false
@@ -802,7 +853,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     @objc private func searchChanged() {
         let needle = searchField.stringValue
         searchTimer?.invalidate()
-        let send = { [weak self] in self?.selectedView?.bindingAction("search:\(needle)") }
+        let send = { [weak self] in self?.searchView?.bindingAction("search:\(needle)") }
         if needle.isEmpty || needle.count >= 3 {
             send()
         } else {
@@ -812,16 +863,25 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func closeSearch(notify: Bool = true) {
         searchTimer?.invalidate()
-        guard !searchBar.isHidden else { return }
+        guard let searched = searchView else { return }
+        searchView = nil
         searchBar.isHidden = true
         searchTotal = -1
         searchSelected = -1
         searchLabel.stringValue = ""
-        if notify { selectedView?.bindingAction("end_search") }
+        if notify { searched.bindingAction("end_search") }
         if let v = selectedView { window.makeFirstResponder(v) }
     }
 
-    func updateSearch(total: Int? = nil, selected sel: Int? = nil) {
+    /// libghostty ended the search in `view` (nil: whichever is open).
+    func searchEnded(in view: SurfaceView?) {
+        guard view == nil || view === searchView else { return }
+        closeSearch(notify: false)
+    }
+
+    /// Search results from `view`; results from any other surface are stale.
+    func updateSearch(total: Int? = nil, selected sel: Int? = nil, from view: SurfaceView? = nil) {
+        if let view, view !== searchView { return }
         if let total { searchTotal = total }
         if let sel { searchSelected = sel }
         if searchTotal < 0 {
@@ -837,7 +897,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         switch sel {
         case #selector(NSResponder.insertNewline(_:)):
             let back = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            selectedView?.bindingAction(back ? "navigate_search:previous" : "navigate_search:next")
+            searchView?.bindingAction(back ? "navigate_search:previous" : "navigate_search:next")
             return true
         case #selector(NSResponder.cancelOperation(_:)):
             closeSearch()
@@ -856,7 +916,9 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             "frame": NSStringFromRect(window.frame),
             "selected": selected,
             "sheet": window.attachedSheet != nil,
-            "search": !searchBar.isHidden ? "\(searchField.stringValue) [\(searchLabel.stringValue)]" : "",
+            "search": searchView != nil ? "\(searchField.stringValue) [\(searchLabel.stringValue)]" : "",
+            "phase": "\(phase)",
+            "closeConfirmations": closeConfirmations.count,
             "tabBar": content.tabBarVisible,
             "manualSize": manualSize.map { String(format: "%.3f x %.3f", $0.w, $0.h) } ?? "",
             "handles": content.handles.map { "\($0.edge)" },

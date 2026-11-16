@@ -24,8 +24,13 @@ final class TabBarView: NSView {
 
     static let height: CGFloat = 26
     private let plusWidth: CGFloat = 28
-    private var hoverIndex: Int?
-    private var hoverClose = false
+
+    /// What the pointer is over.
+    private enum Hover: Equatable {
+        case tab(Int, onClose: Bool)
+        case plus
+    }
+    private var hover: Hover?
     private var dragFrom: Int?
     private var dragStartX: CGFloat = 0
     private var tracking: NSTrackingArea?
@@ -83,7 +88,7 @@ final class TabBarView: NSView {
                 // Accent line.
                 foreground.withAlphaComponent(0.55).setFill()
                 NSRect(x: r.minX, y: 0, width: r.width, height: 2).fill()
-            } else if i == hoverIndex {
+            } else if case .tab(i, _) = hover {
                 mix(background, foreground, 0.13).withAlphaComponent(bgAlpha).setFill()
                 r.fill()
             }
@@ -104,9 +109,9 @@ final class TabBarView: NSView {
             title.draw(in: NSRect(x: textRect.minX, y: r.midY - h / 2 - 1, width: textRect.width, height: h + 2),
                        withAttributes: attrs)
 
-            if i == hoverIndex {
+            if case .tab(i, let onClose) = hover {
                 let cr = closeRect(r)
-                if hoverClose {
+                if onClose {
                     foreground.withAlphaComponent(0.15).setFill()
                     NSBezierPath(roundedRect: cr, xRadius: 3, yRadius: 3).fill()
                 }
@@ -116,7 +121,7 @@ final class TabBarView: NSView {
 
         // "+" button.
         let pr = plusRect
-        let c = foreground.withAlphaComponent(hoverIndex == -1 ? 0.9 : 0.5)
+        let c = foreground.withAlphaComponent(hover == .plus ? 0.9 : 0.5)
         c.setStroke()
         let p = NSBezierPath()
         p.lineWidth = 1.3
@@ -147,18 +152,22 @@ final class TabBarView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        let idx = plusRect.contains(p) ? -1 : index(at: p)
-        let onClose = idx.map { $0 >= 0 && closeRect(tabRects()[$0]).contains(p) } ?? false
-        if idx != hoverIndex || onClose != hoverClose {
-            hoverIndex = idx
-            hoverClose = onClose
+        let h: Hover?
+        if plusRect.contains(p) {
+            h = .plus
+        } else if let i = index(at: p) {
+            h = .tab(i, onClose: closeRect(tabRects()[i]).contains(p))
+        } else {
+            h = nil
+        }
+        if h != hover {
+            hover = h
             needsDisplay = true
         }
     }
 
     override func mouseExited(with event: NSEvent) {
-        hoverIndex = nil
-        hoverClose = false
+        hover = nil
         needsDisplay = true
     }
 
