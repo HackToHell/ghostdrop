@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  macos:
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -67,12 +67,153 @@ jobs:
           shasum -a 256 "Ghostdrop-$VERSION.dmg" > "Ghostdrop-$VERSION.dmg.sha256"
           cat "Ghostdrop-$VERSION.dmg.sha256"
 
+      - name: Upload macOS release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            build/Ghostdrop-*.dmg
+            build/Ghostdrop-*.dmg.sha256
+
+  linux:
+    name: linux (${{ matrix.arch }}, glibc 2.35)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build and smoke-test tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates xz-utils build-essential pkg-config \
+            libegl-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            fontconfig xvfb libgl1-mesa-dri libgl1 binutils
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          submodules: true
+
+      - name: Check tag matches crate version
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' linux/Cargo.toml | head -n 1)"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          if [ "v$v" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match linux/Cargo.toml version $v"
+            exit 1
+          fi
+
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Zig and Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/zig
+            .tools
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: linux-rel-${{ matrix.arch }}-${{ hashFiles('.gitmodules', 'scripts/build-linux.sh', 'patches/**', 'linux/Cargo.lock') }}
+          restore-keys: linux-rel-${{ matrix.arch }}-
+
+      - name: Build Linux binary and tarball
+        run: |
+          ./scripts/ci-run.sh ./scripts/build-linux.sh build
+          ./scripts/ci-run.sh ./dev/ci/linux-test.sh
+          ./scripts/ci-run.sh ./scripts/build-linux.sh tarball "$VERSION"
+
+      - name: Verify tarball and glibc baseline
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          tarball="build/ghostdrop-$VERSION-linux-$arch.tar.gz"
+          (cd build && sha256sum -c "ghostdrop-$VERSION-linux-$arch.tar.gz.sha256")
+
+          T="$(mktemp -d)"
+          trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$T"' EXIT
+          mkdir -p "$T/prefix"
+          tar -xzf "$tarball" -C "$T/prefix" --strip-components=1
+
+          G="$T/prefix/bin/ghostdrop"
+          ldd "$G" | grep -E 'libghostty\.so => .*/lib/ghostdrop/libghostty\.so'
+          # Ensure no GLIBC symbol newer than 2.35 leaked in.
+          bad_glibc="$(readelf -V "$G" "$T/prefix/lib/ghostdrop/libghostty.so" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV \
+            | awk -F'[_.]' '$2 > 2 || ($2 == 2 && $3 > 35)')"
+          if [ -n "$bad_glibc" ]; then
+            echo "::error::Binary requires GLIBC newer than 2.35: $bad_glibc"
+            exit 1
+          fi
+
+          GHOSTDROP_CONFIG="$T/config" "$G" check
+          "$G" +version
+          test -f "$T/prefix/share/doc/ghostdrop/AGENTS.md"
+          test -f "$T/prefix/share/ghostdrop/terminfo/x/xterm-ghostty"
+
+          # Render a frame on Xvfb (software OpenGL).
+          Xvfb :77 -screen 0 1280x800x24 >"$T/xvfb.log" 2>&1 &
+          for _ in $(seq 50); do [ -e /tmp/.X11-unix/X77 ] && break; sleep 0.1; done
+          export DISPLAY=:77 GHOSTDROP_CONFIG="$T/config" GHOSTDROP_SOCKET="$T/gd.sock" GHOSTDROP_DEBUG=1
+          "$G" --daemon >"$T/gd.log" 2>&1 &
+          for _ in $(seq 100); do "$G" ctl ping >/dev/null 2>&1 && break; sleep 0.1; done
+          "$G" ctl show
+          for _ in $(seq 300); do
+            if "$G" ctl dump | grep -qE '"frame":"[0-9]+x[0-9]+'; then
+              echo "rendered: $("$G" ctl dump | grep -oE '"frame":"[^"]*"')"
+              "$G" ctl quit force >/dev/null
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::no frame rendered within 60 s"
+          exit 1
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: |
+            build/ghostdrop-*-linux-*.tar.gz
+            build/ghostdrop-*-linux-*.tar.gz.sha256
+
+  publish:
+    needs: [macos, linux]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          files=("build/Ghostdrop-$VERSION.dmg" "build/Ghostdrop-$VERSION.dmg.sha256")
+          ls -la dist
+          shopt -s nullglob
+          files=(dist/*)
           notes=".github/release-notes/$TAG.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber

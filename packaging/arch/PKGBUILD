@@ -16,7 +16,7 @@ url='https://github.com/HackToHell/ghostdrop'
 license=('MIT')
 depends=('gcc-libs' 'glibc' 'libglvnd' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'fontconfig')
 optdepends=('mesa: GPU rendering on AMD/Intel, and libgbm for zero-copy presentation')
-makedepends=('git' 'rust' 'clang' 'pkgconf')
+makedepends=('git' 'rust' 'pkgconf')
 # Zig and Cargo do their own optimisation and stripping.
 options=('!lto' '!debug')
 _zig=0.17.1

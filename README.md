@@ -34,26 +34,28 @@ To build it yourself, see [Build (macOS)](#build-macos).
 
 ### Linux
 
-**Arch Linux** (and derivatives such as Manjaro): build a package from the repo with
-`makepkg`, which also installs the build tools it needs:
+Works across Linux distributions (Ubuntu 22.04+, Debian 12+, Fedora, Arch,
+openSUSE) on `x86_64` and `aarch64`:
 
 ```sh
-git clone --recurse-submodules https://github.com/HackToHell/ghostdrop
-cd ghostdrop/packaging/arch
-makepkg -si
+git clone https://github.com/HackToHell/ghostdrop && cd ghostdrop
+make install                  # installs into ~/.local (PREFIX=/usr/local to change)
+make update                   # git pull + reinstall
 ```
 
-(`make pkg` in the repo root does the same.) The package builds from your clone
-(local changes included) with the pinned Zig 0.17.1 (checksummed) and the crates
-locked in `linux/Cargo.lock`, and installs `/usr/bin/ghostdrop` plus its own
-libghostty under `/usr/lib/ghostdrop`. To update, `git pull --recurse-submodules`
-and run `makepkg -si` again.
+On a clean release tag (or with `make install RELEASE=latest` / `make download`),
+`make install` downloads the prebuilt release tarball (`glibc 2.35` baseline),
+verifies its SHA-256 checksum, and installs without needing a compiler. Otherwise
+(or with `make install FROM_SOURCE=1`), it builds from source — run `make deps`
+first if system build headers are missing (requires Rust ≥ 1.88, `pkg-config`,
+and `egl` / `xkbcommon` / `xkbcommon-x11` / `xcb` dev packages; Zig 0.17.1 is
+fetched automatically and no `clang` is needed).
 
-**Other distributions:** install Rust, clang (for bindgen), pkg-config and the
-libxkbcommon, libxkbcommon-x11 and libxcb development packages, then
+**Arch Linux** (and derivatives such as Manjaro) can also install as a pacman
+package:
 
 ```sh
-scripts/build-linux.sh install   # → ~/.local/bin/ghostdrop (Zig is fetched if needed)
+make pkg   # runs makepkg -si in packaging/arch
 ```
 
 Then start it from your window manager. On X11 Ghostdrop grabs the hotkey itself;
@@ -173,6 +175,7 @@ Only the Xcode **Command Line Tools** are required (no full Xcode):
 git clone --recurse-submodules https://github.com/HackToHell/ghostdrop && cd ghostdrop
 make            # builds libghostty (downloads Zig 0.17.1 into .tools/ if needed) + the app
 make install    # copies Ghostdrop.app to /Applications (PREFIX=~/Applications to change)
+make update     # git pull + rebuild/reinstall
 open /Applications/Ghostdrop.app
 ```
 
@@ -186,10 +189,12 @@ make dmg SIGN_IDENTITY="Developer ID Application: …" && make notarize   # for 
 ```
 
 Releases are built by GitHub Actions (`.github/workflows/release.yml`): bump
-`CFBundleShortVersionString` in `Resources/Info.plist`, add
-`.github/release-notes/v<version>.md`, then push a `v<version>` tag. The workflow
-builds on a macOS 26 arm64 runner (with precompiled Metal shaders), verifies the disk
-image, and publishes it with a SHA-256 checksum.
+the version in `Resources/Info.plist`, `linux/Cargo.toml` and
+`packaging/arch/PKGBUILD`, add `.github/release-notes/v<version>.md`, then push
+a `v<version>` tag. The workflow builds the macOS arm64 disk image (with
+precompiled Metal shaders) and portable Linux `x86_64` + `aarch64` tarballs
+(`ubuntu:22.04` / `glibc 2.35`), verifies all artifacts, and publishes them with
+SHA-256 checksums.
 
 The disk image contains `Ghostdrop.app`, an `Applications` shortcut to drag it onto,
 and **`Set Up with AI.md`**. If someone launches the app straight from the disk image,

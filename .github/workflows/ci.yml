@@ -58,7 +58,7 @@ jobs:
       # git first, so checkout fetches the submodule with git.
       - name: Install build tools
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf \
+          pacman -Syu --noconfirm --needed base-devel git rust pkgconf \
             libglvnd libxcb libxkbcommon libxkbcommon-x11 fontconfig \
             mesa xorg-server-xvfb
           useradd -m builder

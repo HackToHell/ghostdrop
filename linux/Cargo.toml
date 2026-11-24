@@ -20,9 +20,6 @@ fontdue = "0.9"
 memmap2 = "0.9"
 rustix = { version = "1", features = ["fs", "shm", "pipe", "event", "net", "process", "time"] }
 
-[build-dependencies]
-bindgen = "0.73"
-
 [profile.release]
 opt-level = 3
 lto = "thin"

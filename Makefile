@@ -1,5 +1,11 @@
+UNAME_S   := $(shell uname -s)
 APP       := Ghostdrop
 BUILD     := build
+
+.PHONY: all app test install update clean distclean
+
+ifeq ($(UNAME_S),Darwin)
+
 APPDIR    := $(BUILD)/$(APP).app
 BIN       := $(APPDIR)/Contents/MacOS/ghostdrop
 LIBGHOSTTY:= $(BUILD)/ghostty/lib/libghostty.a
@@ -25,7 +31,7 @@ FRAMEWORKS := AppKit Metal QuartzCore CoreText CoreGraphics CoreVideo IOSurface 
 SWIFTFLAGS := -O -wmo -swift-version 5 -target $(TARGET) -I $(MODULEDIR) \
               $(addprefix -framework ,$(FRAMEWORKS)) -lc++ -Xlinker -dead_strip
 
-.PHONY: all app test libghostty run install dmg notarize clean distclean pkg
+.PHONY: libghostty run dmg notarize
 
 all: app
 
@@ -87,12 +93,64 @@ notarize: dmg
 	xcrun notarytool submit $(DMG) --keychain-profile $(NOTARY_PROFILE) --wait
 	xcrun stapler staple $(DMG)
 
-# Linux (Arch): build and install the package from this checkout (makepkg -si).
-pkg:
-	cd packaging/arch && makepkg -si
-
 clean:
 	rm -rf $(APPDIR) $(BUILD)/include
 
 distclean:
 	rm -rf $(BUILD)
+
+else
+
+PREFIX      ?= $(HOME)/.local
+FROM_SOURCE ?= 0
+RELEASE     ?=
+
+.PHONY: deps download tarball pkg
+
+all: app
+
+app:
+	./scripts/build-linux.sh build
+
+# Uses a prebuilt GitHub Release tarball when HEAD is a clean release tag
+# (or RELEASE=latest / RELEASE=vX.Y.Z), otherwise builds from source.
+# Pass FROM_SOURCE=1 to always build from source.
+install:
+	PREFIX="$(PREFIX)" FROM_SOURCE="$(FROM_SOURCE)" RELEASE="$(RELEASE)" ./scripts/build-linux.sh install-auto
+
+download:
+	PREFIX="$(PREFIX)" ./scripts/build-linux.sh download $(RELEASE)
+
+deps:
+	./scripts/build-linux.sh deps
+
+test:
+	./dev/ci/linux-test.sh
+
+tarball: app
+	./scripts/build-linux.sh tarball
+
+# Linux (Arch): build and install the package from this checkout (makepkg -si).
+pkg:
+	cd packaging/arch && makepkg -si
+
+clean:
+	rm -rf linux/target $(BUILD)/ghostdrop-*-linux-*.tar.gz $(BUILD)/ghostdrop-*-linux-*.tar.gz.sha256
+
+distclean:
+	rm -rf linux/target $(BUILD)
+
+endif
+
+# Pull latest changes, refresh vendor/ghostty if its pinned commit changed, and reinstall.
+update:
+	git pull --ff-only
+	@if [ -f vendor/ghostty/build.zig ]; then \
+		want="$$(git ls-tree HEAD vendor/ghostty | awk '{print $$3}')"; \
+		have="$$(git -C vendor/ghostty rev-parse HEAD 2>/dev/null || true)"; \
+		if [ -n "$$want" ] && [ "$$want" != "$$have" ]; then \
+			git -C vendor/ghostty checkout -- . && git -C vendor/ghostty clean -fd; \
+			git submodule update --init --depth 1 vendor/ghostty; \
+		fi; \
+	fi
+	$(MAKE) install
