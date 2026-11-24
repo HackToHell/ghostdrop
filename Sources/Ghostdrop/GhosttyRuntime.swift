@@ -222,8 +222,12 @@ final class GhosttyRuntime {
         return Unmanaged<SurfaceView>.fromOpaque(ud).takeUnretainedValue()
     }
 
+    /// Always defer to the next main-loop turn: libghostty invokes callbacks
+    /// synchronously while holding non-recursive locks (e.g. renderer_state.mutex
+    /// in mouseButtonCallback -> open_url) or iterating config slices, so running
+    /// AppKit/sheet/focus work inline can re-enter libghostty and deadlock.
     private static func onMain(_ body: @escaping () -> Void) {
-        if Thread.isMainThread { body() } else { DispatchQueue.main.async(execute: body) }
+        DispatchQueue.main.async(execute: body)
     }
 
     // MARK: Actions
@@ -232,12 +236,10 @@ final class GhosttyRuntime {
         guard let rt = runtime(of: app) else { return false }
         let view: SurfaceView? = target.tag == GHOSTTY_TARGET_SURFACE ? Self.view(of: target.target.surface) : nil
 
-        // Helper: forward to the delegate on the main thread.
+        // Helper: forward to the delegate on the next main-loop turn.
         func forward(_ a: RuntimeAction) -> Bool {
-            if Thread.isMainThread {
-                return rt.delegate?.runtime(rt, perform: a, from: view) ?? false
-            }
-            DispatchQueue.main.async { _ = rt.delegate?.runtime(rt, perform: a, from: view) }
+            guard rt.delegate != nil else { return false }
+            onMain { _ = rt.delegate?.runtime(rt, perform: a, from: view) }
             return true
         }
 
@@ -314,9 +316,9 @@ final class GhosttyRuntime {
             return true
 
         case GHOSTTY_ACTION_RING_BELL:
-            let features = rt.uint("bell-features")
             onMain {
-                if features & 0b1 != 0 { NSSound.beep() }
+                guard view == nil || view?.surface != nil else { return }
+                if rt.uint("bell-features") & 0b1 != 0 { NSSound.beep() }
                 view?.ringBell()
             }
             return true
@@ -326,7 +328,7 @@ final class GhosttyRuntime {
             guard let p = v.url else { return false }
             let s = String(decoding: UnsafeRawBufferPointer(start: p, count: Int(v.len)), as: UTF8.self)
             let kind = v.kind
-            onMain { URLOpener.open(s, kind: kind) }
+            onMain { URLOpener.open(s, kind: kind, in: view?.window) }
             return true
 
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
@@ -351,13 +353,15 @@ final class GhosttyRuntime {
 
         case GHOSTTY_ACTION_SECURE_INPUT:
             let mode = action.action.secure_input
-            if let view {
-                // ON/OFF come from password-prompt detection (opt-out via
-                // macos-auto-secure-input); TOGGLE is the user's keybinding.
-                guard mode == GHOSTTY_SECURE_INPUT_TOGGLE || rt.bool("macos-auto-secure-input", true) else { return true }
-                onMain { view.setPasswordInput(mode) }
-            } else {
-                onMain { SecureInput.shared.setGlobal(mode) }
+            onMain {
+                if let view {
+                    // ON/OFF come from password-prompt detection (opt-out via
+                    // macos-auto-secure-input); TOGGLE is the user's keybinding.
+                    guard mode == GHOSTTY_SECURE_INPUT_TOGGLE || rt.bool("macos-auto-secure-input", true) else { return }
+                    view.setPasswordInput(mode)
+                } else {
+                    SecureInput.shared.setGlobal(mode)
+                }
             }
             return true
 
@@ -400,7 +404,7 @@ final class GhosttyRuntime {
         mimesLen: Int,
         list: Bool
     ) -> ghostty_clipboard_read_result_e {
-        guard let view = view(fromUserdata: ud), let surface = view.surface else {
+        guard let view = view(fromUserdata: ud), view.surface != nil else {
             return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
         }
         guard let pb = Clipboard.pasteboard(location) else { return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED }
@@ -417,7 +421,10 @@ final class GhosttyRuntime {
         }
         let available = list ? Clipboard.availableMimes(pb) : []
         if contents.isEmpty && !list { return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE }
-        Clipboard.complete(surface, contents: contents, available: available, state: state)
+        onMain {
+            guard let surface = view.surface else { return }
+            Clipboard.complete(surface, contents: contents, available: available, state: state)
+        }
         return GHOSTTY_CLIPBOARD_READ_STARTED
     }
 
@@ -427,9 +434,11 @@ final class GhosttyRuntime {
         state: UnsafeMutableRawPointer?,
         request: ghostty_clipboard_request_e
     ) {
-        guard let view = view(fromUserdata: ud), let surface = view.surface else { return }
+        guard let view = view(fromUserdata: ud), view.surface != nil else { return }
         guard let confirm else {
-            ghostty_surface_deny_clipboard_request(surface, state)
+            onMain {
+                if let surface = view.surface { ghostty_surface_deny_clipboard_request(surface, state) }
+            }
             return
         }
         let c = confirm.pointee
@@ -462,6 +471,7 @@ final class GhosttyRuntime {
         }()
 
         onMain {
+            guard view.surface != nil else { return }
             Alerts.confirm(
                 in: view.window, title: title, info: info, preview: text,
                 ok: request == GHOSTTY_CLIPBOARD_REQUEST_PASTE ? "Paste" : "Allow",
@@ -500,6 +510,7 @@ final class GhosttyRuntime {
         }
         guard let text = items.first(where: { $0.mime == "text/plain" }).flatMap({ String(data: $0.data, encoding: .utf8) }) else { return }
         onMain {
+            guard view == nil || view?.surface != nil else { return }
             Alerts.confirm(
                 in: view?.window, title: "Allow clipboard write?",
                 info: "A program in this terminal wants to set your clipboard to:",
@@ -654,7 +665,7 @@ enum Clipboard {
 enum URLOpener {
     static let trustedSchemes: Set<String> = ["http", "https", "mailto", "ftp", "sftp", "ssh", "vnc", "x-man-page"]
 
-    static func open(_ s: String, kind: ghostty_action_open_url_kind_e) {
+    static func open(_ s: String, kind: ghostty_action_open_url_kind_e, in window: NSWindow? = nil) {
         let url: URL
         if let u = URL(string: s), u.scheme != nil {
             url = u
@@ -680,7 +691,7 @@ enum URLOpener {
 
         // Untrusted (OSC 8 / unknown scheme / local file): confirm first.
         Alerts.confirm(
-            in: NSApp.keyWindow, title: "Open this link?",
+            in: window ?? NSApp.keyWindow, title: "Open this link?",
             info: "A program in the terminal wants to open:", preview: url.absoluteString,
             ok: "Open", remember: false
         ) { ok, _ in

@@ -833,7 +833,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     }
 
     func startSearch(_ needle: String, in view: SurfaceView?) {
-        guard let view = view ?? selectedView else { return }
+        guard let view = view ?? selectedView, tabs.contains(where: { $0 === view }) else { return }
         if searchView !== view {
             searchView?.bindingAction("end_search")
             searchTotal = -1

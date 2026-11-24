@@ -107,6 +107,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     // MARK: - Titles & bell
 
     func setTitleFromTerminal(_ t: String) {
+        guard surface != nil else { return }
         // Coalesce rapid title updates (e.g. shells setting it per prompt).
         titleTimer?.invalidate()
         titleTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { [weak self] _ in
