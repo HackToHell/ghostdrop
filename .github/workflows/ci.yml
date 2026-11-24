@@ -82,6 +82,14 @@ jobs:
           cd packaging/arch
           sudo -u builder env PKGDEST="$PWD" makepkg --noconfirm
 
+      - name: Linux FFI boundary & unit tests
+        run: |
+          sudo -u builder env \
+            CARGO_HOME="$GITHUB_WORKSPACE/packaging/arch/src/cargo-home" \
+            CARGO_FLAGS="--frozen" \
+            GHOSTTY_DIR="$GITHUB_WORKSPACE/packaging/arch/src/ghostdrop/build/ghostty-linux" \
+            ./scripts/ci-run.sh ./dev/ci/linux-test.sh
+
       - name: Install and smoke test
         run: |
           pacman -U --noconfirm packaging/arch/ghostdrop-*.pkg.tar.*

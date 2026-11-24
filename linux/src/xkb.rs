@@ -1,6 +1,6 @@
 //! xkbcommon keyboard state shared by the Wayland and X11 backends: turns
 //! keycodes into everything libghostty's key encoder needs.
-use crate::ffi::*;
+use crate::ghostty::mods as gmods;
 use crate::keys::Mods;
 use xkbcommon::xkb::{self, compose, Keycode};
 
@@ -204,47 +204,47 @@ impl Xkb {
         }
         let mut gm = 0u32;
         if mods.shift {
-            gm |= GHOSTTY_MODS_SHIFT as u32;
+            gm |= gmods::SHIFT;
         }
         if mods.ctrl {
-            gm |= GHOSTTY_MODS_CTRL as u32;
+            gm |= gmods::CTRL;
         }
         if mods.alt {
-            gm |= GHOSTTY_MODS_ALT as u32;
+            gm |= gmods::ALT;
         }
         if mods.sup {
-            gm |= GHOSTTY_MODS_SUPER as u32;
+            gm |= gmods::SUPER;
         }
         if self.active(self.idx.caps) {
-            gm |= GHOSTTY_MODS_CAPS as u32;
+            gm |= gmods::CAPS;
         }
         if self.active(self.idx.num) {
-            gm |= GHOSTTY_MODS_NUM as u32;
+            gm |= gmods::NUM;
         }
         if self.right[0] {
-            gm |= GHOSTTY_MODS_SHIFT_RIGHT as u32;
+            gm |= gmods::SHIFT_RIGHT;
         }
         if self.right[1] {
-            gm |= GHOSTTY_MODS_CTRL_RIGHT as u32;
+            gm |= gmods::CTRL_RIGHT;
         }
         if self.right[2] {
-            gm |= GHOSTTY_MODS_ALT_RIGHT as u32;
+            gm |= gmods::ALT_RIGHT;
         }
         if self.right[3] {
-            gm |= GHOSTTY_MODS_SUPER_RIGHT as u32;
+            gm |= gmods::SUPER_RIGHT;
         }
         let mut consumed = 0u32;
         if mods.shift && self.consumed(kc, self.idx.shift) {
-            consumed |= GHOSTTY_MODS_SHIFT as u32;
+            consumed |= gmods::SHIFT;
         }
         if mods.alt && self.consumed(kc, self.idx.alt) {
-            consumed |= GHOSTTY_MODS_ALT as u32;
+            consumed |= gmods::ALT;
         }
         if mods.ctrl && self.consumed(kc, self.idx.ctrl) {
-            consumed |= GHOSTTY_MODS_CTRL as u32;
+            consumed |= gmods::CTRL;
         }
         if mods.sup && self.consumed(kc, self.idx.sup) {
-            consumed |= GHOSTTY_MODS_SUPER as u32;
+            consumed |= gmods::SUPER;
         }
 
         KeyInput {

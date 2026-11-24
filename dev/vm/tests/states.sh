@@ -94,13 +94,21 @@ for be in "$@"; do
   R "printf 'control-commands = true\n' > ~/.config/gd-test/config"
   ctl reload
 
-  # X11: the clipboard owner dies mid-read; later pastes still work.
+  # Clipboard owner dies/hangs mid-read: read times out (2 s) and later pastes still work (both X11 and Wayland).
   if [ "$be" = x11 ]; then
     R 'pkill -x xclip; setsid -f sh -c "printf %s \"echo first > /tmp/states-paste1.txt\" | xclip -selection clipboard" >/dev/null 2>&1 </dev/null; sleep 0.4; pkill -STOP -x xclip; rm -f /tmp/states-paste*.txt'
     ctl hide; sleep 0.3; drive 'key ctrl-`\nsleep 0.8\n'
     drive 'key ctrl-shift-V\nsleep 0.5\n'
     R 'pkill -KILL -x xclip'; sleep 3
     R 'setsid -f sh -c "printf %s \"echo second > /tmp/states-paste2.txt\" | xclip -selection clipboard" >/dev/null 2>&1 </dev/null'; sleep 0.4
+    drive 'key ctrl-shift-V\nkey enter\nsleep 0.8\n'
+    expect "paste works after the clipboard owner died mid-read" "$(R 'cat /tmp/states-paste2.txt')" "second"
+  else
+    R 'pkill -x wl-copy; setsid -f sh -c "printf %s \"echo first > /tmp/states-paste1.txt\" | wl-copy" >/dev/null 2>&1 </dev/null; sleep 0.4; pkill -STOP -x wl-copy; rm -f /tmp/states-paste*.txt'
+    ctl hide; sleep 0.3; drive 'key ctrl-`\nsleep 0.8\n'
+    drive 'key ctrl-shift-V\nsleep 0.5\n'
+    R 'pkill -KILL -x wl-copy'; sleep 3
+    R 'setsid -f sh -c "printf %s \"echo second > /tmp/states-paste2.txt\" | wl-copy" >/dev/null 2>&1 </dev/null'; sleep 0.4
     drive 'key ctrl-shift-V\nkey enter\nsleep 0.8\n'
     expect "paste works after the clipboard owner died mid-read" "$(R 'cat /tmp/states-paste2.txt')" "second"
   fi

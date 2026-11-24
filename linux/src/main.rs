@@ -26,27 +26,41 @@ mod wayland;
 mod x11;
 mod xkb;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static QUIT: AtomicBool = AtomicBool::new(false);
-static SIG_PING: OnceLock<calloop::ping::Ping> = OnceLock::new();
+/// Async-signal-safe wakeup fd (an eventfd): the signal handler only calls `libc::write`.
+static SIG_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_signal(_: libc::c_int) {
     QUIT.store(true, Ordering::SeqCst);
-    if let Some(p) = SIG_PING.get() {
-        p.ping();
+    let fd = SIG_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let val: u64 = 1;
+        unsafe {
+            libc::write(fd, (&val as *const u64).cast(), std::mem::size_of::<u64>());
+        }
     }
 }
 
-pub fn install_signal_handlers(ping: calloop::ping::Ping) {
-    let _ = SIG_PING.set(ping);
+/// Installs SIGINT/SIGTERM/SIGHUP handlers and returns a non-blocking eventfd
+/// that becomes readable when a termination signal arrives.
+pub fn install_signal_handlers() -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::event::{eventfd, EventfdFlags};
+    let fd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).map_err(std::io::Error::from)?;
+    SIG_FD.store(fd.as_raw_fd(), Ordering::Release);
     unsafe {
         let h = on_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
         libc::signal(libc::SIGINT, h);
         libc::signal(libc::SIGTERM, h);
         libc::signal(libc::SIGHUP, h);
     }
+    Ok(fd)
+}
+
+pub fn disarm_signal_fd() {
+    SIG_FD.store(-1, Ordering::Release);
 }
 
 pub fn quit_requested() -> bool {

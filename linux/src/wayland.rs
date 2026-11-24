@@ -36,6 +36,7 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use crate::tab::Frame;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_subsurface::WlSubsurface};
@@ -63,6 +64,13 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_view
 use xkbcommon::xkb;
 
 const TEXT_MIMES: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+/// A lost frame callback must not stall redraws or GPU presents forever.
+const FRAME_TIMEOUT: Duration = Duration::from_millis(250);
+/// Compositor must answer zwp_linux_buffer_params_v1.create within this window.
+const DMABUF_CREATE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Per-step timeout for async Wayland clipboard pipe reads/writes.
+const CLIP_READ_STEP_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIP_WRITE_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Zero-copy presentation: DMA-BUF frames become wl_buffers
 /// (linux-dmabuf) on a subsurface over the terminal area.
@@ -70,14 +78,14 @@ struct WlGpu {
     sub: Option<GpuSurface>,
     buffers: Vec<(GpuKey, GpuBuf, u64)>,
     clock: u64,
-    frame_pending: bool,
+    frame_pending: Option<Instant>,
 }
 
 type GpuKey = (u64, u32, u32, u32, u64);
 
 enum GpuBuf {
     /// `create` sent; the compositor answers with created/failed.
-    Pending(ZwpLinuxBufferParamsV1),
+    Pending { params: ZwpLinuxBufferParamsV1, created_at: Instant },
     Ready(WlBuffer),
 }
 
@@ -99,11 +107,15 @@ impl WlGpu {
         }
         for (_, b, _) in self.buffers.drain(..) {
             match b {
-                GpuBuf::Pending(p) => p.destroy(),
+                GpuBuf::Pending { params, .. } => params.destroy(),
                 GpuBuf::Ready(b) => b.destroy(),
             }
         }
-        self.frame_pending = false;
+        self.frame_pending = None;
+    }
+
+    fn frame_pending(&self) -> bool {
+        self.frame_pending.is_some_and(|t| t.elapsed() < FRAME_TIMEOUT)
     }
 }
 
@@ -159,10 +171,15 @@ pub struct WlWin {
     viewporter: Option<WpViewporter>,
     frac: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
-    frame_pending: bool,
+    frame_pending: Option<Instant>,
     needs_redraw: bool,
     serial: u32,
     clip_results: Vec<(u64, Option<String>)>,
+    /// In-flight clipboard read pipes: token -> (calloop source, step deadline).
+    active_reads: HashMap<u64, (RegistrationToken, Instant)>,
+    /// In-flight clipboard write pipes: id -> (calloop source, step deadline).
+    active_writes: HashMap<u64, (RegistrationToken, Instant)>,
+    next_write_id: u64,
     /// Keyboard interactivity of the mapped layer surface.
     kbd: Kbd,
     /// The compositor drops focus from on-demand layer surfaces (sway 1.12
@@ -328,7 +345,7 @@ impl WlWin {
         let (scale, iscale) = (self.scale_f(), self.scale);
         let Some(gpu) = self.gpu.as_mut() else { return Ok(false) };
         let Some(d) = frame.dmabuf() else { return Ok(true) };
-        if gpu.frame_pending || gpu.sub.is_none() {
+        if gpu.frame_pending() || gpu.sub.is_none() {
             return Ok(false);
         }
         // Wait for a frame that fits (resizes take a frame to catch up).
@@ -342,7 +359,12 @@ impl WlWin {
                 *used = gpu.clock;
                 b.clone()
             }
-            Some((_, GpuBuf::Pending(_), _)) => return Ok(false),
+            Some((_, GpuBuf::Pending { created_at, .. }, _)) => {
+                if created_at.elapsed() >= DMABUF_CREATE_TIMEOUT {
+                    return Err("compositor did not respond to dmabuf buffer creation".into());
+                }
+                return Ok(false);
+            }
             None => {
                 let params = self.dmabuf.create_params(&self.qh).map_err(|e| e.to_string())?;
                 for i in 0..d.n_planes {
@@ -354,11 +376,11 @@ impl WlWin {
                     "gpu: creating {}x{} fourcc={:#x} modifier={:#x} planes={}",
                     frame.width, frame.height, d.fourcc, d.modifier, d.n_planes
                 );
-                gpu.buffers.push((key, GpuBuf::Pending(p), gpu.clock));
+                gpu.buffers.push((key, GpuBuf::Pending { params: p, created_at: Instant::now() }, gpu.clock));
                 if gpu.buffers.len() > 6 {
                     let (i, _) = gpu.buffers.iter().enumerate().min_by_key(|(_, b)| b.2).unwrap();
                     match gpu.buffers.remove(i).1 {
-                        GpuBuf::Pending(p) => p.destroy(),
+                        GpuBuf::Pending { params, .. } => params.destroy(),
                         GpuBuf::Ready(b) => b.destroy(),
                     }
                 }
@@ -381,8 +403,63 @@ impl WlWin {
         s.surface.frame(&self.qh, smithay_client_toolkit::compositor::FrameCallbackData(s.surface.clone()));
         s.surface.commit();
         s.mapped = true;
-        gpu.frame_pending = true;
+        gpu.frame_pending = Some(Instant::now());
         Ok(true)
+    }
+
+    fn frame_pending(&self) -> bool {
+        self.frame_pending.is_some_and(|t| t.elapsed() < FRAME_TIMEOUT)
+    }
+
+    /// Expire hung clipboard read/write pipes (dead or paused owner/reader).
+    fn expire_io(&mut self) {
+        let now = Instant::now();
+        let stale_reads: Vec<u64> = self.active_reads.iter().filter(|(_, (_, d))| now >= *d).map(|(&k, _)| k).collect();
+        for token in stale_reads {
+            if let Some((reg, _)) = self.active_reads.remove(&token) {
+                self.handle.remove(reg);
+                crate::core::trace!("wayland clipboard: read {token} owner timed out");
+                self.clip_results.push((token, None));
+            }
+        }
+        let stale_writes: Vec<u64> = self.active_writes.iter().filter(|(_, (_, d))| now >= *d).map(|(&k, _)| k).collect();
+        for wid in stale_writes {
+            if let Some((reg, _)) = self.active_writes.remove(&wid) {
+                self.handle.remove(reg);
+                crate::core::trace!("wayland clipboard: write {wid} reader timed out");
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        let mut best: Option<Instant> = None;
+        let mut consider = |d: Instant| {
+            best = Some(best.map_or(d, |b| b.min(d)));
+        };
+        for (_, d) in self.active_reads.values() {
+            consider(*d);
+        }
+        for (_, d) in self.active_writes.values() {
+            consider(*d);
+        }
+        if self.needs_redraw {
+            if let Some(t) = self.frame_pending {
+                consider(t + FRAME_TIMEOUT);
+            }
+        }
+        if self.needs_present {
+            if let Some(g) = self.gpu.as_ref() {
+                if let Some(t) = g.frame_pending {
+                    consider(t + FRAME_TIMEOUT);
+                }
+                for (_, buf, _) in &g.buffers {
+                    if let GpuBuf::Pending { created_at, .. } = buf {
+                        consider(*created_at + DMABUF_CREATE_TIMEOUT);
+                    }
+                }
+            }
+        }
+        best
     }
 
     fn stop_repeat(&mut self) {
@@ -439,7 +516,7 @@ impl Window for WlWin {
         self.kb_left_at = None;
         self.visible = true;
         self.configured = false;
-        self.frame_pending = false;
+        self.frame_pending = None;
     }
 
     fn hide(&mut self) {
@@ -459,7 +536,7 @@ impl Window for WlWin {
         self.visible = false;
         self.configured = false;
         self.kb_focus = false;
-        self.frame_pending = false;
+        self.frame_pending = None;
         self.pointer_inside = false;
         self.kbd = Kbd::Claiming;
         self.kb_left_at = None;
@@ -605,26 +682,47 @@ impl Window for WlWin {
         let file = std::fs::File::from(fd);
         let _ = rustix::fs::fcntl_setfl(&file, rustix::fs::OFlags::NONBLOCK);
         let mut data = Vec::new();
-        let _ = self.handle.insert_source(Generic::new(file, Interest::READ, Mode::Level), move |_, f, st| {
+        let res = self.handle.insert_source(Generic::new(file, Interest::READ, Mode::Level), move |_, f, st| {
             let f: &mut std::fs::File = unsafe { f.get_mut() };
             let mut buf = [0u8; 65536];
             loop {
                 match f.read(&mut buf) {
                     Ok(0) => {
+                        st.win.active_reads.remove(&token);
                         let text = String::from_utf8_lossy(&data).into_owned();
                         st.core.clipboard_result(&mut st.win, token, Some(text));
                         return Ok(PostAction::Remove);
                     }
-                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        if data.len().saturating_add(n) > crate::core::MAX_CLIPBOARD_BYTES {
+                            crate::core::trace!("wayland clipboard: read {token} exceeded {} bytes; aborting", crate::core::MAX_CLIPBOARD_BYTES);
+                            st.win.active_reads.remove(&token);
+                            st.core.clipboard_result(&mut st.win, token, None);
+                            return Ok(PostAction::Remove);
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                        if let Some((_, d)) = st.win.active_reads.get_mut(&token) {
+                            *d = Instant::now() + CLIP_READ_STEP_TIMEOUT;
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => {
+                        st.win.active_reads.remove(&token);
                         st.core.clipboard_result(&mut st.win, token, None);
                         return Ok(PostAction::Remove);
                     }
                 }
             }
         });
+        match res {
+            Ok(reg) => {
+                self.active_reads.insert(token, (reg, Instant::now() + CLIP_READ_STEP_TIMEOUT));
+            }
+            Err(_) => {
+                self.clip_results.push((token, None));
+            }
+        }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -639,12 +737,26 @@ impl Window for WlWin {
 impl WlState {
     /// Present a frame if one is wanted and the compositor is ready for it.
     fn after_dispatch(&mut self) {
-        let results = std::mem::take(&mut self.win.clip_results);
-        for (token, text) in results {
-            self.core.clipboard_result(&mut self.win, token, text);
+        self.win.expire_io();
+        for _ in 0..8 {
+            let results = std::mem::take(&mut self.win.clip_results);
+            let had_results = !results.is_empty();
+            for (token, text) in results {
+                self.core.clipboard_result(&mut self.win, token, text);
+            }
+            let had_events = ghostty::has_pending();
+            if had_events {
+                self.core.process(&mut self.win);
+            }
+            if self.core.quit || (!had_results && !had_events && self.win.clip_results.is_empty()) {
+                break;
+            }
         }
-        if ghostty::has_pending() {
-            self.core.process(&mut self.win);
+        if self.core.quit {
+            return;
+        }
+        if !self.win.clip_results.is_empty() || ghostty::has_pending() {
+            ghostty::wake();
         }
         self.redraw();
         self.present();
@@ -670,7 +782,7 @@ impl WlState {
     /// Compose and commit the main surface (chrome, or everything on CPU frames).
     fn redraw(&mut self) {
         let w = &mut self.win;
-        if !(w.needs_redraw && w.visible && w.configured && !w.frame_pending) {
+        if !(w.needs_redraw && w.visible && w.configured && !w.frame_pending()) {
             return;
         }
         let Some(layer) = w.layer.as_ref() else { return };
@@ -697,7 +809,6 @@ impl WlState {
             None => surface.set_buffer_scale(w.scale),
         }
         surface.damage_buffer(0, 0, pw as i32, ph as i32);
-        surface.frame(&w.qh, smithay_client_toolkit::compositor::FrameCallbackData(surface.clone()));
         // The terminal comes from the GPU subsurface when the frame is a
         // DMA-BUF; position it (parent state) before this commit.
         let gpu_rect = w.gpu.as_ref().and(self.core.gpu_frame((pw, ph), scale)).map(|(_, r)| r);
@@ -705,8 +816,9 @@ impl WlState {
         let layer = layer.clone();
         w.place_gpu_surface(gpu_rect);
         if buffer.attach_to(&surface).is_ok() {
+            surface.frame(&w.qh, smithay_client_toolkit::compositor::FrameCallbackData(surface.clone()));
             layer.commit();
-            w.frame_pending = true;
+            w.frame_pending = Some(Instant::now());
             w.needs_redraw = false;
             if gpu_rect.is_some() {
                 w.needs_present = true;
@@ -731,8 +843,18 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         .map_err(|e| format!("wayland source: {e}"))?;
 
     let (ping, ping_src) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
-    ghostty::set_waker(ping.clone());
-    crate::install_signal_handlers(ping);
+    ghostty::set_waker(ping);
+    let sig_fd = crate::install_signal_handlers().map_err(|e| format!("signal fd: {e}"))?;
+    handle
+        .insert_source(Generic::new(sig_fd, Interest::READ, Mode::Level), |_, f, st: &mut WlState| {
+            let mut buf = [0u8; 8];
+            let _ = rustix::io::read(&*f, &mut buf);
+            if crate::quit_requested() {
+                st.core.quit = true;
+            }
+            Ok(PostAction::Continue)
+        })
+        .map_err(|e| e.to_string())?;
     handle
         .insert_source(ping_src, |_, _, st: &mut WlState| {
             if crate::quit_requested() {
@@ -745,7 +867,8 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
     let listener = ipc::listen().map_err(|e| format!("control socket: {e}"))?;
     handle
         .insert_source(Generic::new(listener, Interest::READ, Mode::Level), |_, l, st: &mut WlState| {
-            while let Ok((stream, _)) = l.accept() {
+            for _ in 0..16 {
+                let Ok((stream, _)) = l.accept() else { break };
                 if let Some(cmd) = ipc::read_command(&stream) {
                     let reply = st.core.command(&mut st.win, &cmd);
                     ipc::reply(&stream, &reply);
@@ -799,10 +922,13 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         viewporter: globals.bind::<WpViewporter, WlState, NoEvents>(&qh, 1..=1, NoEvents).ok(),
         frac: None,
         viewport: None,
-        frame_pending: false,
+        frame_pending: None,
         needs_redraw: false,
         serial: 0,
         clip_results: Vec::new(),
+        active_reads: HashMap::new(),
+        active_writes: HashMap::new(),
+        next_write_id: 1,
         kbd: Kbd::Claiming,
         ondemand_broken: false,
         exclusive_cfg: false,
@@ -821,6 +947,7 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
     } else {
         st.win.gpu_probed = true;
     }
+    let _ = st.win.conn.flush();
     // Let outputs/seats (and dmabuf feedback) arrive before sizing anything.
     let deadline = Instant::now() + Duration::from_millis(300);
     event_loop.dispatch(Some(Duration::from_millis(50)), &mut st).map_err(|e| e.to_string())?;
@@ -832,9 +959,11 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         st.core.show(&mut st.win);
     }
     while !st.core.quit {
-        let timeout = st
-            .core
-            .next_deadline()
+        let deadline = match (st.core.next_deadline(), st.win.next_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let timeout = deadline
             .map(|d| d.saturating_duration_since(std::time::Instant::now()))
             .unwrap_or(Duration::from_millis(500))
             .min(Duration::from_millis(500));
@@ -843,6 +972,7 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
         st.after_dispatch();
         let _ = st.win.conn.flush();
     }
+    crate::disarm_signal_fd();
     st.core.tabs.clear();
     ipc::cleanup();
     Ok(())
@@ -851,7 +981,10 @@ pub fn run(mut core_builder: impl FnMut() -> Core, show_now: bool) -> Result<(),
 // ---------------------------------------------------------------- handlers
 
 impl CompositorHandler for WlState {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, factor: i32) {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, factor: i32) {
+        if self.win.layer.as_ref().is_none_or(|l| l.wl_surface() != surface) {
+            return;
+        }
         if factor != self.win.scale && factor > 0 {
             self.win.scale = factor;
             self.core.resized(&mut self.win);
@@ -859,9 +992,14 @@ impl CompositorHandler for WlState {
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
-        match self.win.gpu.as_mut() {
-            Some(g) if g.sub.as_ref().is_some_and(|s| &s.surface == surface) => g.frame_pending = false,
-            _ => self.win.frame_pending = false,
+        if let Some(g) = self.win.gpu.as_mut() {
+            if g.sub.as_ref().is_some_and(|s| &s.surface == surface) {
+                g.frame_pending = None;
+                return;
+            }
+        }
+        if self.win.layer.as_ref().is_some_and(|l| l.wl_surface() == surface) {
+            self.win.frame_pending = None;
         }
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -878,11 +1016,17 @@ impl OutputHandler for WlState {
 }
 
 impl LayerShellHandler for WlState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.win.layer.as_ref().is_none_or(|l| l != layer) {
+            return;
+        }
         self.core.hide(&mut self.win);
     }
 
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+        if self.win.layer.as_ref().is_none_or(|l| l != layer) {
+            return;
+        }
         let (w, h) = cfg.new_size;
         if let Some(p) = self.win.probe.take() {
             crate::core::trace!("output probe: {w}x{h}");
@@ -934,12 +1078,24 @@ impl SeatHandler for WlState {
 
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
         if cap == Capability::Keyboard {
+            self.win.stop_repeat();
             if let Some(k) = self.win.keyboard.take() {
                 k.release();
+            }
+            if self.win.kb_focus {
+                self.win.kb_focus = false;
+                self.win.kb_left_at = Some(Instant::now());
+                self.core.focus_changed(&mut self.win, false);
             }
         }
         if cap == Capability::Pointer {
             self.win.pointer = None;
+            if self.win.pointer_inside {
+                self.win.pointer_inside = false;
+                self.win.pointer_left_at = Some(Instant::now());
+                let mods = self.win.mods();
+                self.core.pointer(&mut self.win, PointerInput::Leave, mods);
+            }
         }
     }
 
@@ -1074,6 +1230,10 @@ fn start_repeat(st: &mut WlState, keycode: u32) {
                 let input = x.key(keycode, KeyState::Repeat);
                 st.core.key(&mut st.win, input);
             }
+            if st.win.repeat_key != Some(keycode) || !st.win.kb_focus {
+                st.win.repeat_token = None;
+                return calloop::timer::TimeoutAction::Drop;
+            }
             calloop::timer::TimeoutAction::ToDuration(interval)
         })
         .ok();
@@ -1151,34 +1311,51 @@ impl DataOfferHandler for WlState {
     fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
 }
 
-fn write_all_async(handle: &LoopHandle<'static, WlState>, pipe: WritePipe, text: String) {
+fn write_all_async(win: &mut WlWin, pipe: WritePipe, text: String) {
     let fd: OwnedFd = pipe.into();
     let file = std::fs::File::from(fd);
     let _ = rustix::fs::fcntl_setfl(file.as_fd(), rustix::fs::OFlags::NONBLOCK);
     let bytes = text.into_bytes();
     let mut off = 0usize;
-    let _ = handle.insert_source(Generic::new(file, Interest::WRITE, Mode::Level), move |_, f, _| {
+    let wid = win.next_write_id;
+    win.next_write_id = win.next_write_id.wrapping_add(1);
+    if let Ok(reg) = win.handle.insert_source(Generic::new(file, Interest::WRITE, Mode::Level), move |_, f, st| {
         let f: &mut std::fs::File = unsafe { f.get_mut() };
         loop {
             if off >= bytes.len() {
+                st.win.active_writes.remove(&wid);
                 return Ok(PostAction::Remove);
             }
             match f.write(&bytes[off..]) {
-                Ok(0) => return Ok(PostAction::Remove),
-                Ok(n) => off += n,
+                Ok(0) => {
+                    st.win.active_writes.remove(&wid);
+                    return Ok(PostAction::Remove);
+                }
+                Ok(n) => {
+                    off += n;
+                    if let Some((_, d)) = st.win.active_writes.get_mut(&wid) {
+                        *d = Instant::now() + CLIP_WRITE_STEP_TIMEOUT;
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(PostAction::Continue),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Ok(PostAction::Remove),
+                Err(_) => {
+                    st.win.active_writes.remove(&wid);
+                    return Ok(PostAction::Remove);
+                }
             }
         }
-    });
+    }) {
+        win.active_writes.insert(wid, (reg, Instant::now() + CLIP_WRITE_STEP_TIMEOUT));
+    }
 }
 
 impl DataSourceHandler for WlState {
     fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource, _mime: String, fd: WritePipe) {
         if self.win.copy_source.as_ref().is_some_and(|s| s.inner() == source) {
-            write_all_async(&self.win.handle, fd, self.win.clip_text.clone());
+            let text = self.win.clip_text.clone();
+            write_all_async(&mut self.win, fd, text);
         }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
@@ -1198,7 +1375,8 @@ impl PrimarySelectionDeviceHandler for WlState {
 impl PrimarySelectionSourceHandler for WlState {
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &ZwpPrimarySelectionSourceV1, _: String, pipe: WritePipe) {
         if self.win.primary_source.as_ref().is_some_and(|s| s.inner() == source) {
-            write_all_async(&self.win.handle, pipe, self.win.primary_text.clone());
+            let text = self.win.primary_text.clone();
+            write_all_async(&mut self.win, pipe, text);
         }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &ZwpPrimarySelectionSourceV1) {
@@ -1222,7 +1400,10 @@ impl Dispatch2<WpViewport, WlState> for NoEvents {
 
 struct FracData;
 impl Dispatch2<WpFractionalScaleV1, WlState> for FracData {
-    fn event(&self, st: &mut WlState, _: &WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, _: &Connection, _: &QueueHandle<WlState>) {
+    fn event(&self, st: &mut WlState, proxy: &WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, _: &Connection, _: &QueueHandle<WlState>) {
+        if st.win.frac.as_ref().is_none_or(|f| f != proxy) {
+            return;
+        }
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             if scale != st.win.scale120 && scale > 0 {
                 crate::core::trace!("fractional scale {}", scale as f64 / 120.0);
@@ -1257,7 +1438,7 @@ impl DmabufHandler for WlState {
             ghostty::set_render_device(n);
         }
         ghostty::set_present_modifiers(&mods);
-        self.win.gpu = Some(WlGpu { sub: None, buffers: Vec::new(), clock: 0, frame_pending: false });
+        self.win.gpu = Some(WlGpu { sub: None, buffers: Vec::new(), clock: 0, frame_pending: None });
         self.core.set_gpu_backend(true);
     }
 
@@ -1266,7 +1447,7 @@ impl DmabufHandler for WlState {
             buffer.destroy();
             return;
         };
-        match g.buffers.iter_mut().find(|b| matches!(&b.1, GpuBuf::Pending(p) if p == params)) {
+        match g.buffers.iter_mut().find(|b| matches!(&b.1, GpuBuf::Pending { params: p, .. } if p == params)) {
             Some(b) => {
                 b.1 = GpuBuf::Ready(buffer);
                 self.win.needs_present = true;

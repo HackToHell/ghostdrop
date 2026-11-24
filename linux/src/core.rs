@@ -2,15 +2,20 @@
 //! prompts, search, clipboard, IPC. Backends implement `Window` and feed
 //! normalized input into `Core`.
 use crate::draw::{luminance, mix, Canvas, Font, Rgb};
-use crate::ffi::*;
-use crate::ghostty::{self, complete_clipboard, deny_clipboard, Clip, GEvent, Runtime, SurfaceId};
+use crate::ghostty::{
+    self, Clip, ClipContent, ClipRequestKind, CloseTabMode, GEvent, KeyAction, MouseButton, MouseShape, QuickTerminalSize, Runtime,
+    SurfaceId, mods as gmods,
+};
 use crate::keys::Mods;
 use crate::settings::{Action, Settings, TabBarMode};
 use crate::tab::{Frame, Tab};
 use crate::xkb::{KeyInput, KeyState};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CString;
 use std::time::Instant;
+
+/// Cap clipboard transfers on both X11 (INCR) and Wayland (pipe) so a huge or
+/// runaway selection owner cannot stall or OOM the daemon.
+pub const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 /// `GHOSTDROP_TRACE=1` logs lifecycle/input events to stderr.
 pub fn trace_on() -> bool {
@@ -59,7 +64,7 @@ pub enum Pos {
 #[derive(Clone, Copy)]
 pub struct Placement {
     pub pos: Pos,
-    pub size: ghostty_config_quick_terminal_size_s,
+    pub size: QuickTerminalSize,
     pub fullscreen: bool,
     /// "mouse" | "main" | "macos-menu-bar"
     pub screen_mouse: bool,
@@ -73,15 +78,19 @@ impl Placement {
         if self.fullscreen {
             return (None, None);
         }
-        let p = ghostty::size_dim(&self.size.primary, match self.pos {
-            Pos::Left | Pos::Right => sw,
-            Pos::Center if sw < sh => sw,
-            _ => sh,
+        let p = self.size.primary.map(|d| {
+            d.resolve(match self.pos {
+                Pos::Left | Pos::Right => sw,
+                Pos::Center if sw < sh => sw,
+                _ => sh,
+            })
         });
-        let s = ghostty::size_dim(&self.size.secondary, match self.pos {
-            Pos::Left | Pos::Right => sh,
-            Pos::Center if sw < sh => sh,
-            _ => sw,
+        let s = self.size.secondary.map(|d| {
+            d.resolve(match self.pos {
+                Pos::Left | Pos::Right => sh,
+                Pos::Center if sw < sh => sh,
+                _ => sw,
+            })
         });
         let clamp = |v: f64, max: f64| v.clamp(100.0, max);
         match self.pos {
@@ -154,7 +163,7 @@ pub enum PointerInput {
 enum PromptKind {
     CloseTab(SurfaceId),
     Quit,
-    ClipConfirm { sid: SurfaceId, text: String, state: usize },
+    ClipConfirm { sid: SurfaceId, contents: Vec<ClipContent>, available: Vec<String>, state: usize },
     ClipWrite { clip: Clip, text: String },
     OpenUrl(String),
     Rename(SurfaceId),
@@ -198,12 +207,34 @@ enum Capture {
     /// `button` went down on the tab bar. `drag` = the tab being dragged
     /// (left button on a tab) and the x where it last moved.
     Bar { button: Button, drag: Option<(SurfaceId, f64)> },
-    /// Buttons held in this tab's terminal (bit mask of ghostty button codes).
-    Terminal { id: SurfaceId, held: u32 },
+    /// Buttons held in this tab's terminal (bit mask over `button_index`).
+    Terminal { id: SurfaceId, held: u8 },
 }
 
-fn button_bit(b: Button) -> u32 {
-    1u32 << (ghostty_button(b) as u32 & 31)
+fn button_index(b: Button) -> u8 {
+    match b {
+        Button::Left => 0,
+        Button::Right => 1,
+        Button::Middle => 2,
+        Button::Other(8) => 3,
+        Button::Other(9) => 4,
+        Button::Other(_) => 5,
+    }
+}
+
+fn button_bit(b: Button) -> u8 {
+    1u8 << button_index(b)
+}
+
+fn button_from_index(i: u8) -> MouseButton {
+    match i {
+        0 => MouseButton::Left,
+        1 => MouseButton::Right,
+        2 => MouseButton::Middle,
+        3 => MouseButton::Four,
+        4 => MouseButton::Five,
+        _ => MouseButton::Unknown,
+    }
 }
 
 /// Where a key press went; its repeats and its release follow it there, even
@@ -293,14 +324,14 @@ pub struct Core {
 
 const TAB_BAR_HEIGHT: f64 = 28.0;
 
-fn ghostty_button(b: Button) -> ghostty_input_mouse_button_e {
+fn mouse_button(b: Button) -> MouseButton {
     match b {
-        Button::Left => GHOSTTY_MOUSE_LEFT,
-        Button::Right => GHOSTTY_MOUSE_RIGHT,
-        Button::Middle => GHOSTTY_MOUSE_MIDDLE,
-        Button::Other(8) => GHOSTTY_MOUSE_FOUR,
-        Button::Other(9) => GHOSTTY_MOUSE_FIVE,
-        Button::Other(_) => GHOSTTY_MOUSE_UNKNOWN,
+        Button::Left => MouseButton::Left,
+        Button::Right => MouseButton::Right,
+        Button::Middle => MouseButton::Middle,
+        Button::Other(8) => MouseButton::Four,
+        Button::Other(9) => MouseButton::Five,
+        Button::Other(_) => MouseButton::Unknown,
     }
 }
 
@@ -438,15 +469,16 @@ impl Core {
         let (mut cwd, mut font_size) = (None, 0.0f32);
         let src = source.and_then(|id| self.tab_index(id)).or((!self.tabs.is_empty()).then_some(self.selected));
         if let Some(cur) = src.and_then(|i| self.tabs.get(i)) {
-            font_size = cur.font_size();
+            let (inherited_cwd, inherited_font) = cur.inherited_tab_config();
+            font_size = inherited_font;
             if profile.effective_command().is_none() && cur.profile.effective_command().is_none() {
-                cwd = cur.inherited_cwd();
+                cwd = inherited_cwd;
             }
         }
         let id = self.next_id;
         self.next_id += 1;
         let scale = w.scale();
-        match Tab::new(self.rt.app, id, profile, cwd, font_size, scale) {
+        match Tab::new(&self.rt, id, profile, cwd, font_size, scale) {
             Some(tab) => {
                 let had_bar = self.tab_bar_visible();
                 self.tabs.push(tab);
@@ -528,17 +560,41 @@ impl Core {
     fn close_tab_now(&mut self, w: &mut dyn Window, id: SurfaceId) {
         let Some(idx) = self.tab_index(id) else { return };
         let had_bar = self.tab_bar_visible();
-        self.clip_reads.retain(|_, r| r.sid != id);
+        // Deny in-flight clipboard requests belonging to this tab before freeing its surface.
+        let mut stale_states = Vec::new();
+        self.clip_reads.retain(|_, r| {
+            if r.sid == id {
+                stale_states.push(r.state);
+                false
+            } else {
+                true
+            }
+        });
         if self.search.as_ref().is_some_and(|s| s.sid == id) {
             self.search = None;
         }
         // Questions about this tab are moot now (its surface, and any
         // clipboard request it made, goes away with it).
-        self.prompts.retain(|p| !prompt_about(p, id));
+        self.prompts.retain(|p| {
+            if prompt_about(p, id) {
+                if let PromptKind::ClipConfirm { state, .. } = p.kind {
+                    stale_states.push(state);
+                }
+                false
+            } else {
+                true
+            }
+        });
         let prompt_gone = self.prompt.as_ref().is_some_and(|p| prompt_about(p, id));
         if prompt_gone {
+            if let Some(Prompt { kind: PromptKind::ClipConfirm { state, .. }, .. }) = self.prompt.take() {
+                stale_states.push(state);
+            }
             self.prompt = self.prompts.pop_front();
             w.request_redraw();
+        }
+        for state in stale_states {
+            self.tabs[idx].deny_clipboard(state);
         }
         if matches!(self.capture, Capture::Terminal { id: c, .. } if c == id) {
             self.capture = Capture::None;
@@ -549,7 +605,7 @@ impl Core {
             }
         }
         self.keys_down.retain(|_, t| *t != KeyTarget::Terminal(id));
-        self.tabs.remove(idx); // drop frees the surface
+        self.tabs.remove(idx); // drop frees the surface (and denies any states still in QUEUE)
         // A surface's GL context and buffers free into glibc's per-thread
         // arenas, which keep it (hundreds of MiB after many tabs). Hand it
         // back to the OS once things settle.
@@ -567,6 +623,7 @@ impl Core {
         if had_bar != self.tab_bar_visible() {
             self.relayout(w);
         }
+        self.sync_gpu();
         if prompt_gone {
             self.show_prompt_tab(w);
         }
@@ -610,9 +667,34 @@ impl Core {
         w.request_redraw();
     }
 
+    /// Cancel all interactive prompts (keeping any non-interactive config notice),
+    /// denying pending clipboard requests so terminal apps don't hang waiting.
+    fn cancel_interactive_prompts(&mut self) {
+        let mut notice: Option<Prompt> = None;
+        let mut deny: Vec<(SurfaceId, usize)> = Vec::new();
+        for p in self.prompt.take().into_iter().chain(self.prompts.drain(..)) {
+            match p.kind {
+                PromptKind::Notice => {
+                    if notice.is_none() {
+                        notice = Some(p);
+                    }
+                }
+                PromptKind::ClipConfirm { sid, state, .. } => deny.push((sid, state)),
+                _ => {}
+            }
+        }
+        self.prompt = notice;
+        for (sid, state) in deny {
+            if let Some(i) = self.tab_index(sid) {
+                self.tabs[i].deny_clipboard(state);
+            }
+        }
+    }
+
     pub fn hide(&mut self, w: &mut dyn Window) {
         trace!("hide");
         self.autohide = Autohide::Idle;
+        self.cancel_interactive_prompts();
         // The release of a held button won't reach us once we're gone.
         self.release_capture();
         self.keys_down.clear();
@@ -622,6 +704,7 @@ impl Core {
             t.set_focus(false);
         }
         self.rt.set_focus(false);
+        self.sync_gpu();
     }
 
     pub fn toggle(&mut self, w: &mut dyn Window) {
@@ -862,6 +945,7 @@ impl Core {
             }
         }
         self.show_prompt_tab(w);
+        self.sync_gpu();
         w.request_redraw();
     }
 
@@ -916,25 +1000,30 @@ impl Core {
     /// Handle everything libghostty queued (possibly synchronously during
     /// an input call).
     pub fn process(&mut self, w: &mut dyn Window) {
+        ghostty::assert_not_in_call("Core::process");
         for _ in 0..8 {
             let evs = ghostty::drain();
             if evs.is_empty() {
-                break;
+                return;
             }
             for ev in evs {
                 self.handle(w, ev);
             }
         }
+        if ghostty::has_pending() {
+            ghostty::wake();
+        }
     }
 
     fn handle(&mut self, w: &mut dyn Window, ev: GEvent) {
+        ghostty::assert_not_in_call("Core::handle");
         if !matches!(ev, GEvent::Render(_)) {
             trace!("event {ev:?}");
         }
         match ev {
             GEvent::Render(id) => {
                 if let Some(i) = self.tab_index(id) {
-                    if let Some(f) = Frame::take(self.tabs[i].surface) {
+                    if let Some(f) = self.tabs[i].take_frame() {
                         let gpu = f.dmabuf().is_some();
                         // This tab was asked for GPU frames but CPU frames
                         // keep coming: the driver can't export (e.g. software
@@ -965,12 +1054,12 @@ impl Core {
             }
             GEvent::CloseTab(id, mode) => {
                 let ids: Vec<SurfaceId> = match mode {
-                    m if m == GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER as u32 => self.tabs.iter().map(|t| t.id).filter(|x| *x != id).collect(),
-                    m if m == GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT as u32 => match self.tab_index(id) {
+                    CloseTabMode::Other => self.tabs.iter().map(|t| t.id).filter(|x| *x != id).collect(),
+                    CloseTabMode::Right => match self.tab_index(id) {
                         Some(i) => self.tabs[i + 1..].iter().map(|t| t.id).collect(),
                         None => vec![],
                     },
-                    _ => vec![id],
+                    CloseTabMode::This => vec![id],
                 };
                 for x in ids {
                     if let Some(i) = self.tab_index(x) {
@@ -987,6 +1076,7 @@ impl Core {
                 if w.is_visible() {
                     let p = self.placement();
                     w.show(&p);
+                    self.relayout(w);
                 }
             }
             GEvent::ResetSize => {
@@ -994,12 +1084,13 @@ impl Core {
                 if w.is_visible() {
                     let p = self.placement();
                     w.show(&p);
+                    self.relayout(w);
                 }
             }
             GEvent::Quit => self.request_quit(w),
             GEvent::ReloadConfig { soft } => {
                 if soft {
-                    unsafe { ghostty_app_update_config(self.rt.app, self.rt.config) };
+                    self.rt.soft_reload();
                 } else {
                     self.reload(w);
                 }
@@ -1023,16 +1114,16 @@ impl Core {
                     return;
                 }
                 self.term_cursor = match shape {
-                    s if s == GHOSTTY_MOUSE_SHAPE_DEFAULT as u32 => Cursor::Default,
-                    s if s == GHOSTTY_MOUSE_SHAPE_POINTER as u32 => Cursor::Pointer,
-                    s if s == GHOSTTY_MOUSE_SHAPE_CROSSHAIR as u32 || s == GHOSTTY_MOUSE_SHAPE_CELL as u32 => Cursor::Crosshair,
-                    s if s == GHOSTTY_MOUSE_SHAPE_GRAB as u32 => Cursor::Grab,
-                    s if s == GHOSTTY_MOUSE_SHAPE_GRABBING as u32 => Cursor::Grabbing,
-                    s if s == GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED as u32 => Cursor::NotAllowed,
-                    s if s == GHOSTTY_MOUSE_SHAPE_WAIT as u32 || s == GHOSTTY_MOUSE_SHAPE_PROGRESS as u32 => Cursor::Wait,
-                    s if s == GHOSTTY_MOUSE_SHAPE_EW_RESIZE as u32 || s == GHOSTTY_MOUSE_SHAPE_COL_RESIZE as u32 => Cursor::ResizeH,
-                    s if s == GHOSTTY_MOUSE_SHAPE_NS_RESIZE as u32 || s == GHOSTTY_MOUSE_SHAPE_ROW_RESIZE as u32 => Cursor::ResizeV,
-                    _ => Cursor::Text,
+                    MouseShape::Default => Cursor::Default,
+                    MouseShape::Pointer => Cursor::Pointer,
+                    MouseShape::Crosshair => Cursor::Crosshair,
+                    MouseShape::Grab => Cursor::Grab,
+                    MouseShape::Grabbing => Cursor::Grabbing,
+                    MouseShape::NotAllowed => Cursor::NotAllowed,
+                    MouseShape::Wait => Cursor::Wait,
+                    MouseShape::ResizeH => Cursor::ResizeH,
+                    MouseShape::ResizeV => Cursor::ResizeV,
+                    MouseShape::Text => Cursor::Text,
                 };
                 self.update_cursor(w);
             }
@@ -1058,15 +1149,21 @@ impl Core {
                 spawn_detached("notify-send", &["-a", "Ghostdrop", &title, &body]);
             }
             GEvent::StartSearch(id, needle) => {
-                self.search = Some(Search { sid: id, needle: needle.clone(), total: -1, selected: -1 });
-                if let Some(i) = self.tab_index(id) {
-                    self.tabs[i].binding_action(&format!("search:{needle}"));
+                let Some(i) = self.tab_index(id) else { return };
+                if let Some(prev) = self.search.as_ref().filter(|s| s.sid != id).map(|s| s.sid) {
+                    if let Some(pi) = self.tab_index(prev) {
+                        self.tabs[pi].binding_action("end_search");
+                    }
                 }
+                self.search = Some(Search { sid: id, needle: needle.clone(), total: -1, selected: -1 });
+                self.tabs[i].binding_action(&format!("search:{needle}"));
+                self.sync_gpu();
                 w.request_redraw();
             }
             GEvent::EndSearch(id) => {
                 if self.search.as_ref().is_some_and(|s| s.sid == id) {
                     self.search = None;
+                    self.sync_gpu();
                     w.request_redraw();
                 }
             }
@@ -1097,19 +1194,39 @@ impl Core {
                 }
             }
             GEvent::ClipRead { sid, clip, state, mimes, list } => {
+                if self.tab_index(sid).is_none() {
+                    return;
+                }
                 let token = self.next_token;
                 self.next_token += 1;
                 let want_text = mimes.iter().any(|m| m == "text/plain");
                 self.clip_reads.insert(token, ClipRead { sid, state, want_text, list });
                 w.read_clipboard(clip, token);
             }
-            GEvent::ClipConfirm { sid, text, state, request } => {
-                let title = if request == GHOSTTY_CLIPBOARD_REQUEST_PASTE as u32 {
-                    "Paste this text?"
-                } else {
-                    "Allow a program to read your clipboard?"
+            GEvent::ClipConfirmNil { sid, state } => {
+                if let Some(i) = self.tab_index(sid) {
+                    self.tabs[i].deny_clipboard(state);
+                }
+            }
+            GEvent::ClipConfirm { sid, contents, available, state, kind } => {
+                if self.tab_index(sid).is_none() {
+                    return;
+                }
+                let title = match kind {
+                    ClipRequestKind::Paste => "Paste this text?",
+                    ClipRequestKind::Osc52Read | ClipRequestKind::KittyRead | ClipRequestKind::List => {
+                        "Allow a program to read your clipboard?"
+                    }
+                    _ => "Allow clipboard access?",
                 };
-                self.ask(w, PromptKind::ClipConfirm { sid, text: text.clone(), state }, title.into(), text, None);
+                let preview = contents
+                    .iter()
+                    .find(|c| c.mime == "text/plain")
+                    .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+                    .unwrap_or_else(|| {
+                        contents.iter().map(|c| format!("{} ({} bytes)", c.mime, c.data.len())).collect::<Vec<_>>().join("\n")
+                    });
+                self.ask(w, PromptKind::ClipConfirm { sid, contents, available, state }, title.into(), preview, None);
             }
             GEvent::ClipWrite { clip, text, confirm } => {
                 if confirm {
@@ -1133,12 +1250,14 @@ impl Core {
     pub fn clipboard_result(&mut self, w: &mut dyn Window, token: u64, text: Option<String>) {
         let Some(req) = self.clip_reads.remove(&token) else { return };
         let Some(i) = self.tab_index(req.sid) else { return };
-        let surface = self.tabs[i].surface;
-        let available: Vec<&str> = if req.list && text.is_some() { vec!["text/plain"] } else { vec![] };
+        let available: Vec<String> = if req.list && text.is_some() { vec!["text/plain".into()] } else { vec![] };
         match text {
-            Some(t) if req.want_text => complete_clipboard(surface, Some(&t), req.state, &available, false),
-            _ if req.list => complete_clipboard(surface, None, req.state, &available, false),
-            _ => deny_clipboard(surface, req.state),
+            Some(t) if req.want_text => {
+                let contents = [ClipContent { mime: "text/plain".into(), data: t.into_bytes() }];
+                self.tabs[i].complete_clipboard(&contents, &available, req.state, false);
+            }
+            _ if req.list => self.tabs[i].complete_clipboard(&[], &available, req.state, false),
+            _ => self.tabs[i].deny_clipboard(req.state),
         }
         self.process(w);
     }
@@ -1215,24 +1334,14 @@ impl Core {
     fn send_key(&mut self, w: &mut dyn Window, id: SurfaceId, k: &KeyInput) {
         let Some(i) = self.tab_index(id) else { return };
         let action = match k.state {
-            KeyState::Press => GHOSTTY_ACTION_PRESS,
-            KeyState::Repeat => GHOSTTY_ACTION_REPEAT,
-            KeyState::Release => GHOSTTY_ACTION_RELEASE,
+            KeyState::Press => KeyAction::Press,
+            KeyState::Repeat => KeyAction::Repeat,
+            KeyState::Release => KeyAction::Release,
         };
         let unshifted = xkbcommon::xkb::keysym_to_utf32(xkbcommon::xkb::Keysym::new(k.unshifted));
         let text = (!k.text.is_empty() && k.text.chars().next().is_some_and(|c| c as u32 >= 0x20 && c as u32 != 0x7f))
-            .then(|| CString::new(k.text.as_str()).ok())
-            .flatten();
-        let ev = ghostty_input_key_s {
-            action,
-            mods: k.ghostty_mods as _,
-            consumed_mods: k.consumed as _,
-            keycode: k.keycode,
-            text: text.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
-            unshifted_codepoint: unshifted,
-            composing: k.composing,
-        };
-        unsafe { ghostty_surface_key(self.tabs[i].surface, ev) };
+            .then_some(k.text.as_str());
+        self.tabs[i].key(action, k.ghostty_mods, k.consumed, k.keycode, text, unshifted, k.composing);
         self.process(w);
     }
 
@@ -1283,13 +1392,12 @@ impl Core {
                 }
             }
             PromptKind::Notice => {}
-            PromptKind::ClipConfirm { sid, text, state } => {
+            PromptKind::ClipConfirm { sid, contents, available, state } => {
                 if let Some(i) = self.tab_index(sid) {
-                    let s = self.tabs[i].surface;
                     if yes {
-                        complete_clipboard(s, Some(&text), state, &["text/plain"], true);
+                        self.tabs[i].complete_clipboard(&contents, &available, state, true);
                     } else {
-                        deny_clipboard(s, state);
+                        self.tabs[i].deny_clipboard(state);
                     }
                 }
             }
@@ -1313,6 +1421,7 @@ impl Core {
             }
         }
         self.show_prompt_tab(w);
+        self.sync_gpu();
         self.process(w);
         w.request_redraw();
     }
@@ -1401,17 +1510,15 @@ impl Core {
         (x, y - top)
     }
 
-    fn surface_of(&self, id: SurfaceId) -> Option<ghostty_surface_t> {
-        self.tab_index(id).map(|i| self.tabs[i].surface)
-    }
-
     /// End a capture without its release (we're hiding, so it won't come):
-    /// the terminal is told the buttons went up, or it keeps selecting.
+    /// move pointer off-surface first so a held click on a link cannot open it,
+    /// then tell the terminal the buttons went up so it stops selecting.
     fn release_capture(&mut self) {
         if let Capture::Terminal { id, held } = std::mem::replace(&mut self.capture, Capture::None) {
-            if let Some(s) = self.surface_of(id) {
-                for code in (0..32u32).filter(|c| held & (1 << c) != 0) {
-                    unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_RELEASE, code as _, 0 as _) };
+            if let Some(i) = self.tab_index(id) {
+                self.tabs[i].mouse_pos(-1.0, -1.0, 0);
+                for code in (0..6u8).filter(|c| held & (1 << c) != 0) {
+                    self.tabs[i].mouse_button(false, button_from_index(code), 0);
                 }
             }
         }
@@ -1421,11 +1528,11 @@ impl Core {
         if !matches!(ev, PointerInput::Motion { .. }) {
             trace!("pointer {ev:?} capture={:?}", self.capture);
         }
-        let gm = (if mods.shift { GHOSTTY_MODS_SHIFT as u32 } else { 0 })
-            | (if mods.ctrl { GHOSTTY_MODS_CTRL as u32 } else { 0 })
-            | (if mods.alt { GHOSTTY_MODS_ALT as u32 } else { 0 })
-            | (if mods.sup { GHOSTTY_MODS_SUPER as u32 } else { 0 });
-        let surface = self.selected_tab().map(|t| t.surface);
+        let gm = (if mods.shift { gmods::SHIFT } else { 0 })
+            | (if mods.ctrl { gmods::CTRL } else { 0 })
+            | (if mods.alt { gmods::ALT } else { 0 })
+            | (if mods.sup { gmods::SUPER } else { 0 });
+        let selected_idx = (self.selected < self.tabs.len()).then_some(self.selected);
         match ev {
             PointerInput::Motion { x, y } => {
                 self.mouse = (x, y);
@@ -1437,9 +1544,9 @@ impl Core {
                         if self.hover.take().is_some() {
                             w.request_redraw();
                         }
-                        if let Some(s) = self.surface_of(id) {
+                        if let Some(i) = self.tab_index(id) {
                             let (tx, ty) = self.term_pos(w, x, y);
-                            unsafe { ghostty_surface_mouse_pos(s, tx, ty, gm as _) };
+                            self.tabs[i].mouse_pos(tx, ty, gm);
                         }
                     }
                     _ if in_bar => {
@@ -1467,9 +1574,9 @@ impl Core {
                         if self.hover.take().is_some() {
                             w.request_redraw();
                         }
-                        if let Some(s) = surface {
+                        if let Some(i) = selected_idx {
                             let (tx, ty) = self.term_pos(w, x, y);
-                            unsafe { ghostty_surface_mouse_pos(s, tx, ty, gm as _) };
+                            self.tabs[i].mouse_pos(tx, ty, gm);
                         }
                     }
                 }
@@ -1483,15 +1590,15 @@ impl Core {
                 // While a button is held the pointer is still ours (the
                 // release comes to us); don't cut a selection drag short.
                 if !matches!(self.capture, Capture::Terminal { .. }) {
-                    if let Some(s) = surface {
-                        unsafe { ghostty_surface_mouse_pos(s, -1.0, -1.0, gm as _) };
+                    if let Some(i) = selected_idx {
+                        self.tabs[i].mouse_pos(-1.0, -1.0, gm);
                     }
                 }
             }
             PointerInput::Button { button, pressed: false } => match self.capture {
                 Capture::Terminal { id, held } if held & button_bit(button) != 0 => {
-                    if let Some(s) = self.surface_of(id) {
-                        unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_RELEASE, ghostty_button(button), gm as _) };
+                    if let Some(i) = self.tab_index(id) {
+                        self.tabs[i].mouse_button(false, mouse_button(button), gm);
                     }
                     let held = held & !button_bit(button);
                     self.capture = if held == 0 { Capture::None } else { Capture::Terminal { id, held } };
@@ -1509,8 +1616,8 @@ impl Core {
                 match self.capture {
                     // More buttons during a terminal drag go to that terminal.
                     Capture::Terminal { id, held } => {
-                        if let Some(s) = self.surface_of(id) {
-                            unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_PRESS, ghostty_button(button), gm as _) };
+                        if let Some(i) = self.tab_index(id) {
+                            self.tabs[i].mouse_button(true, mouse_button(button), gm);
                         }
                         self.capture = Capture::Terminal { id, held: held | button_bit(button) };
                     }
@@ -1520,10 +1627,10 @@ impl Core {
                         self.bar_click(w, button, x);
                     }
                     Capture::None => {
-                        if let Some(t) = self.selected_tab() {
-                            let (id, s) = (t.id, t.surface);
+                        if let Some(i) = selected_idx {
+                            let id = self.tabs[i].id;
                             self.capture = Capture::Terminal { id, held: button_bit(button) };
-                            unsafe { ghostty_surface_mouse_button(s, GHOSTTY_MOUSE_PRESS, ghostty_button(button), gm as _) };
+                            self.tabs[i].mouse_button(true, mouse_button(button), gm);
                         }
                     }
                 }
@@ -1531,14 +1638,14 @@ impl Core {
             PointerInput::Scroll { dx, dy, precise } => {
                 let (x, y) = self.mouse;
                 let target = match self.capture {
-                    Capture::Terminal { id, .. } => self.surface_of(id),
+                    Capture::Terminal { id, .. } => self.tab_index(id),
                     Capture::Bar { .. } => None,
-                    Capture::None => surface.filter(|_| !self.in_tab_bar(w, x, y)),
+                    Capture::None => selected_idx.filter(|_| !self.in_tab_bar(w, x, y)),
                 };
-                if let Some(s) = target {
+                if let Some(i) = target {
                     // Wayland/X11 report positive = down/right; Ghostty wants
                     // positive = up/left (same inversion as its GTK app).
-                    unsafe { ghostty_surface_mouse_scroll(s, -dx, -dy, precise as i32) };
+                    self.tabs[i].mouse_scroll(-dx, -dy, precise);
                 }
             }
         }
