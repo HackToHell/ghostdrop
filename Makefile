@@ -25,7 +25,7 @@ FRAMEWORKS := AppKit Metal QuartzCore CoreText CoreGraphics CoreVideo IOSurface 
 SWIFTFLAGS := -O -wmo -swift-version 5 -target $(TARGET) -I $(MODULEDIR) \
               $(addprefix -framework ,$(FRAMEWORKS)) -lc++ -Xlinker -dead_strip
 
-.PHONY: all app libghostty run install dmg notarize clean distclean pkg
+.PHONY: all app test libghostty run install dmg notarize clean distclean pkg
 
 all: app
 
@@ -40,6 +40,9 @@ $(MODULEDIR)/module.modulemap: $(LIBGHOSTTY)
 	printf 'module GhosttyKit {\n  header "ghostty.h"\n  export *\n}\n' > $@
 
 app: $(BIN)
+
+test: $(LIBGHOSTTY) $(MODULEDIR)/module.modulemap
+	./dev/ci/macos-test.sh
 
 $(BIN): $(SOURCES) $(LIBGHOSTTY) $(MODULEDIR)/module.modulemap Resources/Info.plist Resources/AGENTS.md
 	mkdir -p $(APPDIR)/Contents/MacOS $(APPDIR)/Contents/Resources

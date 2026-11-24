@@ -1,5 +1,4 @@
 import AppKit
-import GhosttyKit
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate, NSMenuDelegate {
@@ -140,9 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             + (Self.setupGuidePath ?? "")
         a.addButton(withTitle: "OK")
         a.addButton(withTitle: "Show Guide")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertSecondButtonReturn, let p = Self.setupGuidePath {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+        Alerts.present(a) { resp in
+            if resp == .alertSecondButtonReturn, let p = Self.setupGuidePath {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+            }
         }
     }
 
@@ -157,11 +157,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         a.addButton(withTitle: "Copy AI Setup Prompt")
         a.addButton(withTitle: "Open Terminal")
         a.addButton(withTitle: "Done")
-        NSApp.activate(ignoringOtherApps: true)
-        switch a.runModal() {
-        case .alertFirstButtonReturn: copySetupPrompt()
-        case .alertSecondButtonReturn: drop.show()
-        default: break
+        Alerts.present(a) { [weak self] resp in
+            switch resp {
+            case .alertFirstButtonReturn: self?.copySetupPrompt()
+            case .alertSecondButtonReturn: self?.drop.show()
+            default: break
+            }
         }
     }
 
@@ -172,11 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let app = runtime?.app, ghostty_app_needs_confirm_quit(app) else { return .terminateNow }
-        if !drop.visible { drop.show() }
-        Alerts.confirm(in: drop.window, title: "Quit Ghostdrop?",
-                       info: "Processes are still running in some tabs. Quitting will terminate them.",
-                       ok: "Quit", remember: false) { ok, _ in
+        guard let runtime, runtime.needsConfirmQuit else { return .terminateNow }
+        drop.confirmQuit { ok in
             NSApp.reply(toApplicationShouldTerminate: ok)
         }
         return .terminateLater
@@ -224,11 +222,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
     }
 
     private func updateColorScheme() {
-        guard let app = runtime?.app else { return }
+        guard let runtime else { return }
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let scheme = dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT
-        ghostty_app_set_color_scheme(app, scheme)
-        drop?.tabs.forEach { if let s = $0.surface { ghostty_surface_set_color_scheme(s, scheme) } }
+        runtime.setColorScheme(dark: dark)
+        drop?.tabs.forEach { $0.setColorScheme(dark: dark) }
     }
 
     func perform(_ action: DropAction) {
@@ -270,8 +267,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         a.informativeText = "macOS is blocking Local Network access for Ghostdrop, so ssh/curl to devices on your LAN (or .local hosts) from its tabs will fail with \"No route to host\". Internet and VPN hosts are not affected.\n\nTurn on Ghostdrop in System Settings → Privacy & Security → Local Network."
         a.addButton(withTitle: "Open Settings")
         a.addButton(withTitle: "Not Now")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn { LocalNetworkCheck.openSettings() }
+        Alerts.present(a) { resp in
+            if resp == .alertFirstButtonReturn { LocalNetworkCheck.openSettings() }
+        }
     }
 
     @objc private func openLocalNetworkSettings() { LocalNetworkCheck.openSettings() }
@@ -307,11 +305,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         case .quit:
             NSApp.terminate(nil)
         case .reloadConfig(let soft):
-            if soft, let app = rt.app, let cfg = rt.config { ghostty_app_update_config(app, cfg) } else { reloadConfig() }
+            if soft { rt.softReload() } else { reloadConfig() }
         case .openConfig:
             openConfig()
         case .promptTitle:
-            drop.renameTab()
+            drop.renameTab(for: surface ?? drop.selectedView)
         case .floatWindow:
             break
         case .copyTitle:
@@ -333,6 +331,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
 
     func runtimeConfigDidChange(_ rt: GhosttyRuntime) {
         drop?.applyAppearance()
+    }
+
+    func runtime(
+        _ rt: GhosttyRuntime,
+        confirm title: String,
+        info: String,
+        preview: String?,
+        ok: String,
+        remember: Bool,
+        from surface: SurfaceView?,
+        completion: @escaping (_ ok: Bool, _ remember: Bool) -> Void
+    ) {
+        drop.confirm(title: title, info: info, preview: preview, ok: ok, remember: remember, from: surface, completion: completion)
     }
 
     // MARK: - Control channel
@@ -388,7 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             menuNeedsUpdate(m)
             try? m.items.map { $0.title }.joined(separator: "\n").write(toFile: arg ?? "/tmp/ghostdrop-menu.txt", atomically: true, encoding: .utf8)
         case "goto-tab":
-            if let n = arg.flatMap(Int32.init) { drop.gotoTab(n) }
+            if let target = arg.flatMap(Int32.init).flatMap(TabTarget.init(raw:)) { drop.gotoTab(target) }
         case "resize":
             // `resize <edge> <dx> <dy>`: hit-test the edge, then drag it by (dx, dy) points.
             let parts = (arg ?? "").split(separator: " ").map(String.init)
@@ -529,8 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
         let a = NSAlert()
         a.messageText = "Configuration issues"
         a.informativeText = settings.errors.joined(separator: "\n")
-        NSApp.activate(ignoringOtherApps: true)
-        a.runModal()
+        Alerts.present(a)
     }
 
     private func setLoginItem(_ on: Bool) {
@@ -552,8 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GhosttyRuntimeDelegate
             }
         } catch {
             let a = NSAlert(error: error)
-            NSApp.activate(ignoringOtherApps: true)
-            a.runModal()
+            Alerts.present(a)
         }
     }
 }

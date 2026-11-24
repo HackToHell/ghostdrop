@@ -1,5 +1,4 @@
 import AppKit
-import GhosttyKit
 
 /// Borderless panel that can still become key.
 final class DropPanel: NSPanel {
@@ -99,8 +98,71 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     private var resizeStart: (edge: ResizeHandle.Edge, mouse: NSPoint, frame: NSRect)?
     private var handlesPosition: DropPosition?
 
-    /// Tabs whose close needs confirming; the first one is being asked.
-    private var closeConfirmations: [SurfaceView] = []
+    /// Unified queue of sheet prompts (close tab, quit, rename, clipboard, URL).
+    /// Only one sheet is active at a time; every prompt resolves exactly once.
+    private final class PendingPrompt {
+        enum Kind {
+            case closeTab(SurfaceView)
+            case quit((Bool) -> Void)
+            case renameTab(SurfaceView)
+            case confirm(
+                surface: SurfaceView?,
+                title: String,
+                info: String,
+                preview: String?,
+                ok: String,
+                remember: Bool,
+                completion: (_ ok: Bool, _ remember: Bool) -> Void
+            )
+        }
+
+        let kind: Kind
+        private var finished = false
+
+        init(_ kind: Kind) { self.kind = kind }
+
+        var surface: SurfaceView? {
+            switch kind {
+            case .closeTab(let v), .renameTab(let v): return v
+            case .confirm(let v, _, _, _, _, _, _): return v
+            case .quit: return nil
+            }
+        }
+
+        var selectsTab: Bool { surface != nil }
+
+        func matchesDuplicate(_ other: PendingPrompt) -> Bool {
+            switch (kind, other.kind) {
+            case (.closeTab(let a), .closeTab(let b)): return a === b
+            case (.renameTab(let a), .renameTab(let b)): return a === b
+            case (.quit, .quit): return true
+            default: return false
+            }
+        }
+
+        func resolve(ok: Bool, remember: Bool = false, input: String? = nil, in controller: DropController?) {
+            guard !finished else { return }
+            finished = true
+            switch kind {
+            case .closeTab(let v):
+                if ok { controller?.close(v) }
+            case .quit(let reply):
+                reply(ok)
+            case .renameTab(let v):
+                if ok, let input { v.titleOverride = input.isEmpty ? nil : input }
+            case .confirm(_, _, _, _, _, _, let completion):
+                completion(ok, remember)
+            }
+        }
+
+        func cancel() {
+            resolve(ok: false, remember: false, input: nil, in: nil)
+        }
+    }
+
+    private var activePrompt: PendingPrompt?
+    private var activePromptID = 0
+    private var promptQueue: [PendingPrompt] = []
 
     // Search overlay. `searchView` is the surface being searched (nil = closed).
     private weak var searchView: SurfaceView?
@@ -182,8 +244,8 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         if opacity < 1 {
             window.isOpaque = false
             window.backgroundColor = .white.withAlphaComponent(0.001)
-            if window.isVisible, let app = runtime.app, runtime.uint("background-blur") != 0 {
-                ghostty_set_window_background_blur(app, Unmanaged.passUnretained(window).toOpaque())
+            if window.isVisible, runtime.uint("background-blur") != 0 {
+                runtime.setWindowBackgroundBlur(window)
             }
         } else {
             window.isOpaque = true
@@ -238,11 +300,11 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         }
     }
 
-    private func dimension(_ s: ghostty_quick_terminal_size_s, of parent: CGFloat) -> CGFloat? {
-        switch s.tag {
-        case GHOSTTY_QUICK_TERMINAL_SIZE_PERCENTAGE: return parent * CGFloat(s.value.percentage) / 100
-        case GHOSTTY_QUICK_TERMINAL_SIZE_PIXELS: return CGFloat(s.value.pixels)
-        default: return nil
+    private func dimension(_ s: QuickTerminalDimension?, of parent: CGFloat) -> CGFloat? {
+        switch s {
+        case .percentage(let pct): return parent * CGFloat(pct) / 100
+        case .pixels(let px): return CGFloat(px)
+        case nil: return nil
         }
     }
 
@@ -297,7 +359,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     // MARK: - Show / hide
 
     func toggle() {
-        if visible && window.isKeyWindow {
+        if visible && (window.isKeyWindow || window.attachedSheet?.isKeyWindow == true) {
             hide()
         } else if visible {
             // Visible but not focused (e.g. autohide off): just focus it.
@@ -316,7 +378,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         updateOcclusion()
     }
 
-    func show() {
+    func show(animated: Bool = true) {
         guard !visible else { return focus() }
         phase = .showing
         generation += 1
@@ -333,7 +395,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
         let screen = currentScreen()
         let target = targetFrame(on: screen)
-        let duration = runtime.double("quick-terminal-animation-duration", 0)
+        let duration = animated ? runtime.double("quick-terminal-animation-duration", 0) : 0
         if NSApp.isHidden { NSApp.unhide(nil) }
 
         // Make the surface visible to the renderer before we appear.
@@ -374,8 +436,26 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         })
     }
 
+    private func ensureVisibleForPrompt() {
+        if !visible {
+            show(animated: false)
+        } else if phase == .showing {
+            generation += 1
+            phase = .shown
+            window.level = .floating
+            window.alphaValue = 1
+            window.setFrame(targetFrame(on: window.screen ?? currentScreen()), display: true)
+            applyAppearance()
+        }
+    }
+
     func focus() {
         guard visible else { return }
+        if let sheet = window.attachedSheet {
+            NSApp.activate(ignoringOtherApps: true)
+            sheet.makeKeyAndOrderFront(nil)
+            return
+        }
         if !window.isKeyWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -390,10 +470,9 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         phase = .hiding
         generation += 1
         let gen = generation
-        // Hiding cancels the confirmations still waiting (their tabs stay
-        // open), so none of them pops the drop-down back up.
-        closeConfirmations.removeAll()
-        if let sheet = window.attachedSheet { window.endSheet(sheet) }
+        // Hiding cancels the active sheet and any queued prompts so none of
+        // them pops the drop-down back up or leaves clipboard/quit unanswered.
+        cancelAllPrompts()
 
         if restoreFocus, let prev = previousApp, !prev.isTerminated {
             prev.activate(options: [])
@@ -447,7 +526,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     func windowDidResignKey(_ notification: Notification) {
         syncFocus()
-        guard phase == .shown, window.attachedSheet == nil else { return }
+        guard phase == .shown, window.attachedSheet == nil, activePrompt == nil, promptQueue.isEmpty else { return }
         guard runtime.bool("quick-terminal-autohide", true) else { return }
         // Focus went elsewhere on purpose: don't steal it back.
         hide(restoreFocus: false)
@@ -507,11 +586,11 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
     /// quick-terminal-size/position the saved size is dropped.
     private var sizeSignature: String {
         let s = runtime.quickTerminalSize
-        func d(_ x: ghostty_quick_terminal_size_s) -> String {
-            switch x.tag {
-            case GHOSTTY_QUICK_TERMINAL_SIZE_PERCENTAGE: return "\(x.value.percentage)%"
-            case GHOSTTY_QUICK_TERMINAL_SIZE_PIXELS: return "\(x.value.pixels)px"
-            default: return "-"
+        func d(_ x: QuickTerminalDimension?) -> String {
+            switch x {
+            case .percentage(let pct): return "\(Float(pct))%"
+            case .pixels(let px): return "\(UInt32(px))px"
+            case nil: return "-"
             }
         }
         return "\(position.rawValue)|\(d(s.primary))|\(d(s.secondary))"
@@ -581,11 +660,10 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         // (local shell → local shell), like Ghostty does.
         var cwd: String?
         var fontSize: Float = 0
-        if let cur = selectedView, let s = cur.surface {
-            let inherited = ghostty_surface_inherited_config(s, GHOSTTY_SURFACE_CONTEXT_TAB)
-            fontSize = inherited.font_size
-            if profile.effectiveCommand == nil, cur.profile.effectiveCommand == nil, let wd = inherited.working_directory {
-                cwd = String(cString: wd)
+        if let cur = selectedView, let inherited = cur.inheritedTabConfig() {
+            fontSize = inherited.fontSize
+            if profile.effectiveCommand == nil, cur.profile.effectiveCommand == nil {
+                cwd = inherited.workingDirectory
             }
         }
 
@@ -625,15 +703,15 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         updateTabBar()
     }
 
-    func gotoTab(_ raw: Int32) {
+    func gotoTab(_ target: TabTarget) {
         guard !tabs.isEmpty else { return }
-        switch raw {
-        case GHOSTTY_GOTO_TAB_PREVIOUS.rawValue: select((selected - 1 + tabs.count) % tabs.count)
-        case GHOSTTY_GOTO_TAB_NEXT.rawValue: select((selected + 1) % tabs.count)
-        case GHOSTTY_GOTO_TAB_LAST.rawValue: select(tabs.count - 1)
-        default:
-            guard raw >= 1 else { return }
-            select(min(Int(raw) - 1, tabs.count - 1))
+        switch target {
+        case .previous: select((selected - 1 + tabs.count) % tabs.count)
+        case .next: select((selected + 1) % tabs.count)
+        case .last: select(tabs.count - 1)
+        case .index(let i):
+            guard i >= 0 else { return }
+            select(min(i, tabs.count - 1))
         }
     }
 
@@ -659,17 +737,32 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     /// Asks Ghostty to close the surface; it calls back (with confirmation needs).
     func requestClose(_ view: SurfaceView) {
-        guard let s = view.surface else { return close(view) }
-        ghostty_surface_request_close(s)
+        guard view.surface != nil else { return close(view) }
+        view.requestClose()
     }
 
     func close(_ view: SurfaceView) {
         guard let idx = tabs.firstIndex(where: { $0 === view }) else { return }
         if view === searchView { closeSearch(notify: false) }
+
+        // Cancel any prompts scoped to this tab (and dismiss its active sheet).
+        let dropped = promptQueue.filter { $0.surface === view }
+        promptQueue.removeAll { $0.surface === view }
+        dropped.forEach { $0.cancel() }
+        let dismissedActive = activePrompt?.surface === view
+        let activeToCancel = dismissedActive ? activePrompt : nil
+        let hadAttachedSheet = window.attachedSheet != nil
+        if dismissedActive {
+            activePrompt = nil
+            activePromptID += 1
+            if let sheet = window.attachedSheet { window.endSheet(sheet) }
+        }
+        activeToCancel?.cancel()
+
         tabs.remove(at: idx)
         view.removeFromSuperview()
         view.owner = nil
-        // Free on the next runloop turn: we may be inside a libghostty callback.
+        // Free on the next runloop turn so callers unwind cleanly first.
         DispatchQueue.main.async { view.destroy() }
 
         if tabs.isEmpty {
@@ -680,35 +773,50 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         }
         if idx < selected || selected >= tabs.count { selected = max(0, selected - 1) }
         select(min(selected, tabs.count - 1))
+        if dismissedActive && !hadAttachedSheet && visible && activePrompt == nil {
+            presentNextPrompt()
+        }
     }
 
-    func closeTabs(mode: ghostty_action_close_tab_mode_e, from view: SurfaceView?) {
+    func closeTabs(mode: CloseTabMode, from view: SurfaceView?) {
         guard let view, let idx = tabs.firstIndex(where: { $0 === view }) else { return }
         switch mode {
-        case GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER:
+        case .other:
             tabs.enumerated().filter { $0.offset != idx }.forEach { requestClose($0.element) }
-        case GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT:
+        case .right:
             tabs.enumerated().filter { $0.offset > idx }.forEach { requestClose($0.element) }
-        default:
+        case .this:
             requestClose(view)
         }
     }
 
-    func renameTab() {
-        guard let v = selectedView else { return }
-        let alert = NSAlert()
-        alert.messageText = "Rename Tab"
-        alert.informativeText = "Leave empty to use the title set by the terminal."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = v.titleOverride ?? ""
-        alert.accessoryView = field
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        alert.beginSheetModal(for: window) { resp in
-            guard resp == .alertFirstButtonReturn else { return }
-            v.titleOverride = field.stringValue.isEmpty ? nil : field.stringValue
-        }
+    func renameTab(for view: SurfaceView? = nil) {
+        guard let v = view ?? selectedView, tabs.contains(where: { $0 === v }) else { return }
+        enqueuePrompt(PendingPrompt(.renameTab(v)))
+    }
+
+    func confirmQuit(reply: @escaping (Bool) -> Void) {
+        enqueuePrompt(PendingPrompt(.quit(reply)))
+    }
+
+    func confirm(
+        title: String,
+        info: String,
+        preview: String? = nil,
+        ok: String,
+        remember: Bool,
+        from surface: SurfaceView?,
+        completion: @escaping (_ ok: Bool, _ remember: Bool) -> Void
+    ) {
+        enqueuePrompt(PendingPrompt(.confirm(
+            surface: surface,
+            title: title,
+            info: info,
+            preview: preview,
+            ok: ok,
+            remember: remember,
+            completion: completion
+        )))
     }
 
     func updateTabBar() {
@@ -723,39 +831,107 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         content.tabBar.selected = selected
     }
 
+    // MARK: - Unified prompt queue
+
+    private func enqueuePrompt(_ prompt: PendingPrompt) {
+        GhosttyFFI.assertNotInCall()
+        if let v = prompt.surface, !tabs.contains(where: { $0 === v }) {
+            prompt.cancel()
+            return
+        }
+        if activePrompt?.matchesDuplicate(prompt) == true || promptQueue.contains(where: { $0.matchesDuplicate(prompt) }) {
+            prompt.cancel()
+            return
+        }
+        promptQueue.append(prompt)
+        if activePrompt == nil { presentNextPrompt() }
+    }
+
+    private func cancelAllPrompts() {
+        let queued = promptQueue
+        promptQueue.removeAll()
+        let current = activePrompt
+        activePrompt = nil
+        activePromptID += 1
+        if let sheet = window.attachedSheet { window.endSheet(sheet) }
+        current?.cancel()
+        queued.forEach { $0.cancel() }
+    }
+
+    private func presentNextPrompt() {
+        GhosttyFFI.assertNotInCall()
+        guard activePrompt == nil else { return }
+        while let head = promptQueue.first, let v = head.surface, !tabs.contains(where: { $0 === v }) {
+            promptQueue.removeFirst().cancel()
+        }
+        guard !promptQueue.isEmpty else { return }
+
+        let prompt = promptQueue.removeFirst()
+        activePrompt = prompt
+        activePromptID += 1
+        let pid = activePromptID
+
+        ensureVisibleForPrompt()
+        if prompt.selectsTab, let v = prompt.surface, let i = tabs.firstIndex(where: { $0 === v }) {
+            select(i)
+        }
+
+        let alert: NSAlert
+        var renameField: NSTextField?
+        switch prompt.kind {
+        case .closeTab:
+            alert = Alerts.makeConfirmation(
+                title: "Close this tab?",
+                info: "A process is still running in this tab. Closing it will terminate the process.",
+                ok: "Close",
+                remember: false
+            )
+        case .quit:
+            alert = Alerts.makeConfirmation(
+                title: "Quit Ghostdrop?",
+                info: "Processes are still running in some tabs. Quitting will terminate them.",
+                ok: "Quit",
+                remember: false
+            )
+        case .renameTab(let v):
+            let a = NSAlert()
+            a.messageText = "Rename Tab"
+            a.informativeText = "Leave empty to use the title set by the terminal."
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+            field.stringValue = v.titleOverride ?? ""
+            a.accessoryView = field
+            a.addButton(withTitle: "OK")
+            a.addButton(withTitle: "Cancel")
+            a.window.initialFirstResponder = field
+            renameField = field
+            alert = a
+        case .confirm(_, let title, let info, let preview, let ok, let remember, _):
+            alert = Alerts.makeConfirmation(title: title, info: info, preview: preview, ok: ok, remember: remember)
+        }
+
+        alert.beginSheetModal(for: window) { [weak self] resp in
+            guard let self else {
+                prompt.cancel()
+                return
+            }
+            let ok = resp == .alertFirstButtonReturn
+            let remember = alert.suppressionButton?.state == .on
+            if self.activePromptID == pid {
+                self.activePrompt = nil
+            }
+            prompt.resolve(ok: ok, remember: remember, input: renameField?.stringValue, in: self)
+            if self.activePrompt == nil && self.visible {
+                self.presentNextPrompt()
+                if self.activePrompt == nil { self.focus() }
+            }
+        }
+    }
+
     // MARK: - SurfaceOwner
 
     func surfaceRequestedClose(_ view: SurfaceView, needsConfirm: Bool) {
-        guard needsConfirm else {
-            // Not the one on screen: its answer comes back through the queue.
-            if let i = closeConfirmations.firstIndex(where: { $0 === view }), i > 0 {
-                closeConfirmations.remove(at: i)
-            }
-            return close(view)
-        }
-        // One question at a time, asked with its tab in front (closing
-        // several busy tabs at once would otherwise select the last one while
-        // the first question is on screen).
-        guard !closeConfirmations.contains(where: { $0 === view }) else { return }
-        closeConfirmations.append(view)
-        if closeConfirmations.count == 1 { confirmNextClose() }
-    }
-
-    private func confirmNextClose() {
-        closeConfirmations.removeAll { v in !tabs.contains { $0 === v } }
-        guard let view = closeConfirmations.first, let i = tabs.firstIndex(where: { $0 === view }) else { return }
-        if !visible { show() }
-        select(i)
-        Alerts.confirm(in: window, title: "Close this tab?",
-                       info: "A process is still running in this tab. Closing it will terminate the process.",
-                       ok: "Close", remember: false) { [weak self] ok, _ in
-            guard let self else { return }
-            // Cancelled by hide(): the queue is already empty.
-            guard self.closeConfirmations.first === view else { return }
-            self.closeConfirmations.removeFirst()
-            if ok { self.close(view) }
-            self.confirmNextClose()
-        }
+        guard needsConfirm else { return close(view) }
+        enqueuePrompt(PendingPrompt(.closeTab(view)))
     }
 
     func surfaceTitleDidChange(_ view: SurfaceView) { updateTabBar() }
@@ -779,7 +955,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
 
     private func handleKeyBinding(_ e: NSEvent) -> Bool {
         // Don't steal keys from sheets (e.g. rename dialog).
-        if window.attachedSheet != nil { return false }
+        if window.attachedSheet != nil || activePrompt != nil { return false }
         for (combo, action) in settings.bindings where combo.matches(e) {
             perform(action)
             return true
@@ -791,10 +967,10 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
         switch action {
         case .newTab(let p): newTab(profile: p)
         case .closeTab: if let v = selectedView { requestClose(v) }
-        case .nextTab: gotoTab(GHOSTTY_GOTO_TAB_NEXT.rawValue)
-        case .previousTab: gotoTab(GHOSTTY_GOTO_TAB_PREVIOUS.rawValue)
-        case .lastTab: gotoTab(GHOSTTY_GOTO_TAB_LAST.rawValue)
-        case .gotoTab(let n): gotoTab(Int32(n))
+        case .nextTab: gotoTab(.next)
+        case .previousTab: gotoTab(.previous)
+        case .lastTab: gotoTab(.last)
+        case .gotoTab(let n): if n >= 1 { gotoTab(.index(n - 1)) }
         case .moveTab(let n): moveTab(by: n)
         case .toggle: toggle()
         case .hide: hide()
@@ -918,7 +1094,7 @@ final class DropController: NSObject, NSWindowDelegate, SurfaceOwner, TabBarDele
             "sheet": window.attachedSheet != nil,
             "search": searchView != nil ? "\(searchField.stringValue) [\(searchLabel.stringValue)]" : "",
             "phase": "\(phase)",
-            "closeConfirmations": closeConfirmations.count,
+            "prompts": (activePrompt != nil ? 1 : 0) + promptQueue.count,
             "tabBar": content.tabBarVisible,
             "manualSize": manualSize.map { String(format: "%.3f x %.3f", $0.w, $0.h) } ?? "",
             "handles": content.handles.map { "\($0.edge)" },

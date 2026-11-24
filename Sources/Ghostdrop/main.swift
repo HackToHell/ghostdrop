@@ -1,5 +1,4 @@
 import AppKit
-import GhosttyKit
 
 // `ghostdrop ctl <command>` talks to the running instance and exits.
 let args = CommandLine.arguments
@@ -19,13 +18,11 @@ for v in ["GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR", "GHOSTTY_SHELL_FEATURES", 
 // (+show-config --default --docs, +explain-config, +list-themes, +list-fonts, ...),
 // which is how agents/users get the reference for the bundled engine version.
 if args.count >= 2 && args[1].hasPrefix("+") {
-    var argv = args.map { strdup($0) } + [nil]
-    if ghostty_init(UInt(args.count), &argv) != GHOSTTY_SUCCESS { exit(1) }
-    ghostty_cli_try_action()  // exits
+    if !GhosttyFFI.initGlobal(args: args) { exit(1) }
+    GhosttyFFI.runCLIAction()  // exits
     exit(0)
 }
-var argv0: [UnsafeMutablePointer<CChar>?] = [strdup(args[0]), nil]
-if ghostty_init(1, &argv0) != GHOSTTY_SUCCESS {
+if !GhosttyFFI.initGlobal(args: [args[0]]) {
     FileHandle.standardError.write("ghostdrop: ghostty_init failed\n".data(using: .utf8)!)
     exit(1)
 }

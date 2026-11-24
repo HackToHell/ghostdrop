@@ -1,6 +1,5 @@
 import AppKit
 import Carbon.HIToolbox
-import GhosttyKit
 
 /// Owner of a set of surfaces (the drop-down controller).
 protocol SurfaceOwner: AnyObject {
@@ -14,7 +13,8 @@ protocol SurfaceOwner: AnyObject {
 /// An NSView hosting one libghostty surface (one terminal). libghostty attaches
 /// its own Metal (IOSurface) layer to this view and renders on its own thread.
 final class SurfaceView: NSView, NSTextInputClient {
-    private(set) var surface: ghostty_surface_t?
+    private weak var runtime: GhosttyRuntime?
+    private(set) var surface: GhosttySurface?
     weak var owner: SurfaceOwner?
     let profile: Profile
 
@@ -50,37 +50,18 @@ final class SurfaceView: NSView, NSTextInputClient {
     override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { false }
 
-    init(runtime: GhosttyRuntime, profile: Profile, workingDirectory: String?, fontSize: Float = 0,
-         context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_TAB) {
+    init(runtime: GhosttyRuntime, profile: Profile, workingDirectory: String?, fontSize: Float = 0) {
+        self.runtime = runtime
         self.profile = profile
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
 
-        guard let app = runtime.app else { return }
-        var cfg = ghostty_surface_config_new()
-        cfg.userdata = Unmanaged.passUnretained(self).toOpaque()
-        cfg.platform_tag = GHOSTTY_PLATFORM_MACOS
-        cfg.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(nsview: Unmanaged.passUnretained(self).toOpaque()))
-        cfg.scale_factor = Double(NSScreen.main?.backingScaleFactor ?? 2)
-        cfg.font_size = fontSize
-        cfg.wait_after_command = profile.waitAfterCommand
-        cfg.context = context
-
-        let wd = profile.workingDirectory ?? workingDirectory
-        let env = profile.env.map { ($0.key, $0.value) }
-        surface = withOptionalCString(wd) { cwd in
-            withOptionalCString(profile.effectiveCommand) { cmd in
-                withCStringPairs(env) { pairs in
-                    var vars = pairs.map { ghostty_env_var_s(key: $0.0, value: $0.1) }
-                    return vars.withUnsafeMutableBufferPointer { buf in
-                        cfg.working_directory = cwd
-                        cfg.command = cmd
-                        cfg.env_vars = buf.count > 0 ? buf.baseAddress : nil
-                        cfg.env_var_count = buf.count
-                        return ghostty_surface_new(app, &cfg)
-                    }
-                }
-            }
-        }
+        surface = runtime.createSurface(
+            for: self,
+            profile: profile,
+            workingDirectory: workingDirectory,
+            fontSize: fontSize,
+            scaleFactor: Double(NSScreen.main?.backingScaleFactor ?? 2)
+        )
         updateTrackingAreas()
         registerForDraggedTypes([.fileURL, .URL, .string])
     }
@@ -96,13 +77,26 @@ final class SurfaceView: NSView, NSTextInputClient {
         }
         guard let s = surface else { return }
         surface = nil
-        ghostty_surface_free(s)
+        runtime?.unregisterSurface(s.id)
+        s.destroy()
     }
 
     deinit { destroy() }
 
-    var processExited: Bool { surface.map { ghostty_surface_process_exited($0) } ?? true }
-    var needsConfirmQuit: Bool { surface.map { ghostty_surface_needs_confirm_quit($0) } ?? false }
+    var processExited: Bool { surface?.processExited ?? true }
+    var needsConfirmQuit: Bool { surface?.needsConfirmQuit ?? false }
+
+    func inheritedTabConfig() -> InheritedSurfaceConfig? {
+        surface?.inheritedTabConfig()
+    }
+
+    func setColorScheme(dark: Bool) {
+        surface?.setColorScheme(dark: dark)
+    }
+
+    func requestClose() {
+        surface?.requestClose()
+    }
 
     // MARK: - Titles & bell
 
@@ -130,16 +124,15 @@ final class SurfaceView: NSView, NSTextInputClient {
     }
 
     func bindingAction(_ action: String) {
-        guard let surface else { return }
-        _ = ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+        _ = surface?.bindingAction(action)
     }
 
-    func setPasswordInput(_ mode: ghostty_action_secure_input_e) {
+    func setPasswordInput(_ mode: SecureInputMode) {
         guard surface != nil else { return }
         switch mode {
-        case GHOSTTY_SECURE_INPUT_ON: passwordInput = true
-        case GHOSTTY_SECURE_INPUT_OFF: passwordInput = false
-        default: passwordInput.toggle()
+        case .on: passwordInput = true
+        case .off: passwordInput = false
+        case .toggle: passwordInput.toggle()
         }
         if passwordInput {
             SecureInput.shared.setScoped(ObjectIdentifier(self), focused: focused)
@@ -149,8 +142,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     }
 
     func setOcclusion(visible: Bool) {
-        guard let surface else { return }
-        ghostty_surface_set_occlusion(surface, visible)
+        surface?.setOcclusion(visible)
     }
 
     // MARK: - Focus
@@ -159,7 +151,7 @@ final class SurfaceView: NSView, NSTextInputClient {
         guard let surface, focused != f else { return }
         focused = f
         if !f { suppressNextLeftMouseUp = false }
-        ghostty_surface_set_focus(surface, f)
+        surface.setFocus(f)
         if passwordInput { SecureInput.shared.setScoped(ObjectIdentifier(self), focused: f) }
         if f { clearBell() }
     }
@@ -187,7 +179,7 @@ final class SurfaceView: NSView, NSTextInputClient {
         contentSize = size
         guard let surface, size.width > 0, size.height > 0 else { return }
         let scaled = convertToBacking(size)
-        ghostty_surface_set_size(surface, UInt32(scaled.width), UInt32(scaled.height))
+        surface.setSize(width: UInt32(scaled.width), height: UInt32(scaled.height))
     }
 
     override func viewDidMoveToWindow() {
@@ -199,7 +191,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     func updateDisplayID() {
         guard let surface, let screen = window?.screen,
               let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 else { return }
-        ghostty_surface_set_display_id(surface, id)
+        surface.setDisplayID(id)
     }
 
     override func viewDidChangeBackingProperties() {
@@ -212,9 +204,9 @@ final class SurfaceView: NSView, NSTextInputClient {
         }
         guard let surface, frame.width > 0, frame.height > 0 else { return }
         let fb = convertToBacking(frame)
-        ghostty_surface_set_content_scale(surface, fb.width / frame.width, fb.height / frame.height)
+        surface.setContentScale(x: fb.width / frame.width, y: fb.height / frame.height)
         let scaled = convertToBacking(contentSize ?? frame.size)
-        ghostty_surface_set_size(surface, UInt32(scaled.width), UInt32(scaled.height))
+        surface.setSize(width: UInt32(scaled.width), height: UInt32(scaled.height))
     }
 
     override func updateTrackingAreas() {
@@ -228,25 +220,24 @@ final class SurfaceView: NSView, NSTextInputClient {
 
     // MARK: - Cursor
 
-    func setCursorShape(_ shape: ghostty_action_mouse_shape_e) {
+    func setCursorShape(_ shape: MouseShape) {
         let c: NSCursor
         switch shape {
-        case GHOSTTY_MOUSE_SHAPE_DEFAULT: c = .arrow
-        case GHOSTTY_MOUSE_SHAPE_TEXT: c = .iBeam
-        case GHOSTTY_MOUSE_SHAPE_POINTER: c = .pointingHand
-        case GHOSTTY_MOUSE_SHAPE_GRAB: c = .openHand
-        case GHOSTTY_MOUSE_SHAPE_GRABBING: c = .closedHand
-        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR, GHOSTTY_MOUSE_SHAPE_CELL: c = .crosshair
-        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT: c = .iBeamCursorForVerticalLayout
-        case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU: c = .contextualMenu
-        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED, GHOSTTY_MOUSE_SHAPE_NO_DROP: c = .operationNotAllowed
-        case GHOSTTY_MOUSE_SHAPE_EW_RESIZE, GHOSTTY_MOUSE_SHAPE_COL_RESIZE: c = .resizeLeftRight
-        case GHOSTTY_MOUSE_SHAPE_NS_RESIZE, GHOSTTY_MOUSE_SHAPE_ROW_RESIZE: c = .resizeUpDown
-        case GHOSTTY_MOUSE_SHAPE_W_RESIZE: c = .resizeLeft
-        case GHOSTTY_MOUSE_SHAPE_E_RESIZE: c = .resizeRight
-        case GHOSTTY_MOUSE_SHAPE_N_RESIZE: c = .resizeUp
-        case GHOSTTY_MOUSE_SHAPE_S_RESIZE: c = .resizeDown
-        default: return
+        case .defaultArrow: c = .arrow
+        case .text: c = .iBeam
+        case .pointer: c = .pointingHand
+        case .grab: c = .openHand
+        case .grabbing: c = .closedHand
+        case .crosshair: c = .crosshair
+        case .verticalText: c = .iBeamCursorForVerticalLayout
+        case .contextMenu: c = .contextualMenu
+        case .notAllowed: c = .operationNotAllowed
+        case .resizeEW: c = .resizeLeftRight
+        case .resizeNS: c = .resizeUpDown
+        case .resizeW: c = .resizeLeft
+        case .resizeE: c = .resizeRight
+        case .resizeN: c = .resizeUp
+        case .resizeS: c = .resizeDown
         }
         cursor = c
         window?.invalidateCursorRects(for: self)
@@ -267,7 +258,7 @@ final class SurfaceView: NSView, NSTextInputClient {
 
     // MARK: - Mouse
 
-    private func mods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e { GhosttyInput.mods(flags) }
+    private func mods(_ flags: NSEvent.ModifierFlags) -> GhosttyMods { GhosttyInput.mods(flags) }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { false }
 
@@ -284,8 +275,7 @@ final class SurfaceView: NSView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         if handleFocusClick(event) { return }
-        guard let surface else { return }
-        ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(event.modifierFlags))
+        surface?.mouseButton(state: .press, button: .left, mods: mods(event.modifierFlags))
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -295,32 +285,30 @@ final class SurfaceView: NSView, NSTextInputClient {
         }
         prevPressureStage = 0
         guard let surface else { return }
-        ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(event.modifierFlags))
-        ghostty_surface_mouse_pressure(surface, 0, 0)
+        surface.mouseButton(state: .release, button: .left, mods: mods(event.modifierFlags))
+        surface.mousePressure(stage: 0, pressure: 0)
     }
 
     override func rightMouseDown(with event: NSEvent) {
         guard let surface else { return super.rightMouseDown(with: event) }
-        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT, mods(event.modifierFlags)) {
+        if !surface.mouseButton(state: .press, button: .right, mods: mods(event.modifierFlags)) {
             super.rightMouseDown(with: event)
         }
     }
 
     override func rightMouseUp(with event: NSEvent) {
         guard let surface else { return super.rightMouseUp(with: event) }
-        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, mods(event.modifierFlags)) {
+        if !surface.mouseButton(state: .release, button: .right, mods: mods(event.modifierFlags)) {
             super.rightMouseUp(with: event)
         }
     }
 
     override func otherMouseDown(with event: NSEvent) {
-        guard let surface else { return }
-        ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GhosttyInput.button(event.buttonNumber), mods(event.modifierFlags))
+        surface?.mouseButton(state: .press, button: GhosttyInput.button(event.buttonNumber), mods: mods(event.modifierFlags))
     }
 
     override func otherMouseUp(with event: NSEvent) {
-        guard let surface else { return }
-        ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GhosttyInput.button(event.buttonNumber), mods(event.modifierFlags))
+        surface?.mouseButton(state: .release, button: GhosttyInput.button(event.buttonNumber), mods: mods(event.modifierFlags))
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -331,7 +319,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     override func mouseExited(with event: NSEvent) {
         guard let surface else { return }
         if NSEvent.pressedMouseButtons != 0 { return }
-        ghostty_surface_mouse_pos(surface, -1, -1, mods(event.modifierFlags))
+        surface.mousePos(x: -1, y: -1, mods: mods(event.modifierFlags))
     }
 
     override func mouseMoved(with event: NSEvent) { sendMousePos(event) }
@@ -342,7 +330,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     private func sendMousePos(_ event: NSEvent) {
         guard let surface else { return }
         let p = convert(event.locationInWindow, from: nil)
-        ghostty_surface_mouse_pos(surface, p.x, frame.height - p.y, mods(event.modifierFlags))
+        surface.mousePos(x: p.x, y: frame.height - p.y, mods: mods(event.modifierFlags))
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -351,9 +339,7 @@ final class SurfaceView: NSView, NSTextInputClient {
         var y = event.scrollingDeltaY
         let precise = event.hasPreciseScrollingDeltas
         if precise { x *= 2; y *= 2 }
-        var m: Int32 = precise ? 1 : 0
-        m |= Int32(GhosttyInput.momentum(event.momentumPhase)) << 1
-        ghostty_surface_mouse_scroll(surface, x, y, m)
+        surface.mouseScroll(x: x, y: y, precise: precise, momentum: GhosttyInput.momentum(event.momentumPhase))
     }
 
     /// Three-finger swipe left/right switches tabs (like iTerm2).
@@ -363,7 +349,7 @@ final class SurfaceView: NSView, NSTextInputClient {
 
     override func pressureChange(with event: NSEvent) {
         guard let surface else { return }
-        ghostty_surface_mouse_pressure(surface, UInt32(event.stage), Double(event.pressure))
+        surface.mousePressure(stage: UInt32(event.stage), pressure: Double(event.pressure))
         guard prevPressureStage < 2 else { return }
         prevPressureStage = event.stage
         guard event.stage == 2 else { return }
@@ -380,7 +366,7 @@ final class SurfaceView: NSView, NSTextInputClient {
         clearBell()
 
         // Translate mods (e.g. macos-option-as-alt) for text generation.
-        let translated = GhosttyInput.flags(ghostty_surface_key_translation_mods(surface, mods(event.modifierFlags)))
+        let translated = GhosttyInput.flags(surface.keyTranslationMods(mods(event.modifierFlags)))
         var translationMods = event.modifierFlags
         for flag in [NSEvent.ModifierFlags.shift, .control, .option, .command] {
             if translated.contains(flag) { translationMods.insert(flag) } else { translationMods.remove(flag) }
@@ -397,7 +383,7 @@ final class SurfaceView: NSView, NSTextInputClient {
                 isARepeat: event.isARepeat, keyCode: event.keyCode) ?? event
         }
 
-        let action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
+        let action: KeyAction = event.isARepeat ? .repeatKey : .press
         keyTextAccumulator = []
         defer { keyTextAccumulator = nil }
 
@@ -435,20 +421,16 @@ final class SurfaceView: NSView, NSTextInputClient {
     }
 
     override func keyUp(with event: NSEvent) {
-        _ = keyAction(GHOSTTY_ACTION_RELEASE, event: event)
+        _ = keyAction(.release, event: event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown, focused, let surface else { return false }
 
         // Is it a Ghostty keybinding? Then send it through keyDown.
-        var kev = GhosttyInput.keyEvent(event, GHOSTTY_ACTION_PRESS)
-        var flags = ghostty_binding_flags_e(0)
-        let isBinding = (event.characters ?? "").withCString { p -> Bool in
-            kev.text = p
-            return ghostty_surface_key_is_binding(surface, kev, &flags)
-        }
-        if isBinding {
+        var kev = GhosttyInput.keyEvent(event, .press)
+        kev.text = event.characters ?? ""
+        if surface.keyIsBinding(kev) {
             keyDown(with: event)
             return true
         }
@@ -489,19 +471,19 @@ final class SurfaceView: NSView, NSTextInputClient {
     }
 
     override func flagsChanged(with event: NSEvent) {
-        let mod: UInt32
+        let mod: GhosttyMods
         switch event.keyCode {
-        case 0x39: mod = GHOSTTY_MODS_CAPS.rawValue
-        case 0x38, 0x3C: mod = GHOSTTY_MODS_SHIFT.rawValue
-        case 0x3B, 0x3E: mod = GHOSTTY_MODS_CTRL.rawValue
-        case 0x3A, 0x3D: mod = GHOSTTY_MODS_ALT.rawValue
-        case 0x37, 0x36: mod = GHOSTTY_MODS_SUPER.rawValue
+        case 0x39: mod = .caps
+        case 0x38, 0x3C: mod = .shift
+        case 0x3B, 0x3E: mod = .ctrl
+        case 0x3A, 0x3D: mod = .alt
+        case 0x37, 0x36: mod = .superMod
         default: return
         }
         if hasMarkedText() { return }
         let m = mods(event.modifierFlags)
-        var action = GHOSTTY_ACTION_RELEASE
-        if m.rawValue & mod != 0 {
+        var action: KeyAction = .release
+        if m.contains(mod) {
             let raw = event.modifierFlags.rawValue
             let sidePressed: Bool
             switch event.keyCode {
@@ -511,35 +493,34 @@ final class SurfaceView: NSView, NSTextInputClient {
             case 0x36: sidePressed = raw & UInt(NX_DEVICERCMDKEYMASK) != 0
             default: sidePressed = true
             }
-            if sidePressed { action = GHOSTTY_ACTION_PRESS }
+            if sidePressed { action = .press }
         }
         _ = keyAction(action, event: event)
     }
 
-    private func keyAction(_ action: ghostty_input_action_e, event: NSEvent, translationEvent: NSEvent? = nil,
+    private func keyAction(_ action: KeyAction, event: NSEvent, translationEvent: NSEvent? = nil,
                            text: String? = nil, composing: Bool = false) -> Bool {
         guard let surface else { return false }
         var kev = GhosttyInput.keyEvent(event, action, translationMods: translationEvent?.modifierFlags)
         kev.composing = composing
         if let text, !text.isEmpty, let first = text.unicodeScalars.first, first.value >= 0x20, first.value != 0x7F {
-            return text.withCString { p in
-                kev.text = p
-                return ghostty_surface_key(surface, kev)
-            }
+            kev.text = text
         }
-        return ghostty_surface_key(surface, kev)
+        return surface.key(kev)
     }
 
-    private func committedText(_ action: ghostty_input_action_e, _ text: String) -> Bool {
+    private func committedText(_ action: KeyAction, _ text: String) -> Bool {
         guard let surface else { return false }
-        var kev = ghostty_input_key_s()
-        kev.action = action
-        kev.mods = GHOSTTY_MODS_NONE
-        kev.consumed_mods = GHOSTTY_MODS_NONE
-        return text.withCString { p in
-            kev.text = p
-            return ghostty_surface_key(surface, kev)
-        }
+        let kev = GhosttyKeyEvent(
+            action: action,
+            mods: [],
+            consumedMods: [],
+            keycode: 0,
+            text: text,
+            unshiftedCodepoint: 0,
+            composing: false
+        )
+        return surface.key(kev)
     }
 
     private static func shouldReplayCommittedPreeditKey(_ event: NSEvent) -> Bool {
@@ -564,11 +545,8 @@ final class SurfaceView: NSView, NSTextInputClient {
     }
 
     func selectedRange() -> NSRange {
-        guard let surface else { return NSRange() }
-        var text = ghostty_text_s()
-        guard ghostty_surface_read_selection(surface, &text) else { return NSRange() }
-        defer { ghostty_surface_free_text(surface, &text) }
-        return NSRange(location: Int(text.offset_start), length: Int(text.offset_len))
+        guard let sel = surface?.readSelection() else { return NSRange() }
+        return NSRange(location: sel.offsetStart, length: sel.offsetLen)
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
@@ -590,17 +568,12 @@ final class SurfaceView: NSView, NSTextInputClient {
     func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
 
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        guard let surface, range.length > 0 else { return nil }
-        var text = ghostty_text_s()
-        guard ghostty_surface_read_selection(surface, &text) else { return nil }
-        defer { ghostty_surface_free_text(surface, &text) }
+        guard let surface, range.length > 0, let sel = surface.readSelection() else { return nil }
         var attrs: [NSAttributedString.Key: Any] = [:]
-        if let raw = ghostty_surface_quicklook_font(surface) {
-            let font = Unmanaged<CTFont>.fromOpaque(raw)
-            attrs[.font] = font.takeUnretainedValue()
-            font.release()
+        if let font = surface.quicklookFont() {
+            attrs[.font] = font
         }
-        return NSAttributedString(string: String(cString: text.text), attributes: attrs)
+        return NSAttributedString(string: sel.text, attributes: attrs)
     }
 
     func characterIndex(for point: NSPoint) -> Int { 0 }
@@ -609,17 +582,12 @@ final class SurfaceView: NSView, NSTextInputClient {
         guard let surface else { return NSRect(origin: frame.origin, size: .zero) }
         var x: Double = 0, y: Double = 0
         var w: Double = cellSize.width, h: Double = cellSize.height
-        if range.length > 0 && range != selectedRange() {
-            var text = ghostty_text_s()
-            if ghostty_surface_read_selection(surface, &text) {
-                x = text.tl_px_x - 2
-                y = text.tl_px_y + 2
-                ghostty_surface_free_text(surface, &text)
-            } else {
-                ghostty_surface_ime_point(surface, &x, &y, &w, &h)
-            }
+        if range.length > 0 && range != selectedRange(), let sel = surface.readSelection() {
+            x = sel.tlPxX - 2
+            y = sel.tlPxY + 2
         } else {
-            ghostty_surface_ime_point(surface, &x, &y, &w, &h)
+            let pt = surface.imePoint()
+            x = pt.x; y = pt.y; w = pt.width; h = pt.height
         }
         if range.length == 0, w > 0 {
             w = 0
@@ -662,7 +630,7 @@ final class SurfaceView: NSView, NSTextInputClient {
             keyTextAccumulator = acc
             return
         }
-        if !chars.isEmpty { _ = committedText(GHOSTTY_ACTION_PRESS, chars) }
+        if !chars.isEmpty { _ = committedText(.press, chars) }
     }
 
     override func doCommand(by selector: Selector) {
@@ -675,10 +643,9 @@ final class SurfaceView: NSView, NSTextInputClient {
     private func syncPreedit(clearIfNeeded: Bool = true) {
         guard let surface else { return }
         if markedText.length > 0 {
-            let s = markedText.string
-            s.withCString { p in ghostty_surface_preedit(surface, p, UInt(s.utf8.count)) }
+            surface.preedit(markedText.string)
         } else if clearIfNeeded {
-            ghostty_surface_preedit(surface, nil, 0)
+            surface.preedit(nil)
         }
     }
 
@@ -702,96 +669,81 @@ final class SurfaceView: NSView, NSTextInputClient {
             text = pb.string(forType: .string)
         }
         guard let text, !text.isEmpty else { return false }
-        text.withCString { p in ghostty_surface_paste_text(surface, p, UInt(text.utf8.count)) }
+        surface.pasteText(text)
         return true
     }
 
     override func quickLook(with event: NSEvent) {
-        guard let surface else { return super.quickLook(with: event) }
-        var text = ghostty_text_s()
-        guard ghostty_surface_quicklook_word(surface, &text) else { return super.quickLook(with: event) }
-        defer { ghostty_surface_free_text(surface, &text) }
-        guard text.text_len > 0 else { return super.quickLook(with: event) }
+        guard let surface, let word = surface.quicklookWord() else { return super.quickLook(with: event) }
         var attrs: [NSAttributedString.Key: Any] = [:]
-        if let raw = ghostty_surface_quicklook_font(surface) {
-            let font = Unmanaged<CTFont>.fromOpaque(raw)
-            attrs[.font] = font.takeUnretainedValue()
-            font.release()
+        if let font = surface.quicklookFont() {
+            attrs[.font] = font
         }
-        let pt = NSPoint(x: text.tl_px_x, y: frame.height - text.tl_px_y)
-        showDefinition(for: NSAttributedString(string: String(cString: text.text), attributes: attrs), at: pt)
+        let pt = NSPoint(x: word.tlPxX, y: frame.height - word.tlPxY)
+        showDefinition(for: NSAttributedString(string: word.text, attributes: attrs), at: pt)
     }
 
     // MARK: - Debug helpers
 
     /// Visible screen contents as plain text.
     func visibleText() -> String {
-        guard let surface else { return "" }
-        var text = ghostty_text_s()
-        let sel = ghostty_selection_s(
-            top_left: ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: 0),
-            bottom_right: ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: 0, y: 0),
-            rectangle: false)
-        guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
-        defer { ghostty_surface_free_text(surface, &text) }
-        return String(cString: text.text)
+        surface?.readViewportText() ?? ""
     }
 
     func sendText(_ s: String) {
-        guard let surface else { return }
-        s.withCString { p in ghostty_surface_text(surface, p, UInt(s.utf8.count)) }
+        surface?.text(s)
     }
 
     var gridSize: (cols: Int, rows: Int) {
-        guard let surface else { return (0, 0) }
-        let s = ghostty_surface_size(surface)
-        return (Int(s.columns), Int(s.rows))
+        guard let g = surface?.gridSize else { return (0, 0) }
+        return (g.cols, g.rows)
     }
 }
 
 // MARK: - Input helpers
 
 enum GhosttyInput {
-    static func mods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
-        var m: UInt32 = GHOSTTY_MODS_NONE.rawValue
-        if flags.contains(.shift) { m |= GHOSTTY_MODS_SHIFT.rawValue }
-        if flags.contains(.control) { m |= GHOSTTY_MODS_CTRL.rawValue }
-        if flags.contains(.option) { m |= GHOSTTY_MODS_ALT.rawValue }
-        if flags.contains(.command) { m |= GHOSTTY_MODS_SUPER.rawValue }
-        if flags.contains(.capsLock) { m |= GHOSTTY_MODS_CAPS.rawValue }
+    static func mods(_ flags: NSEvent.ModifierFlags) -> GhosttyMods {
+        var m: GhosttyMods = []
+        if flags.contains(.shift) { m.insert(.shift) }
+        if flags.contains(.control) { m.insert(.ctrl) }
+        if flags.contains(.option) { m.insert(.alt) }
+        if flags.contains(.command) { m.insert(.superMod) }
+        if flags.contains(.capsLock) { m.insert(.caps) }
         let raw = flags.rawValue
-        if raw & UInt(NX_DEVICERSHIFTKEYMASK) != 0 { m |= GHOSTTY_MODS_SHIFT_RIGHT.rawValue }
-        if raw & UInt(NX_DEVICERCTLKEYMASK) != 0 { m |= GHOSTTY_MODS_CTRL_RIGHT.rawValue }
-        if raw & UInt(NX_DEVICERALTKEYMASK) != 0 { m |= GHOSTTY_MODS_ALT_RIGHT.rawValue }
-        if raw & UInt(NX_DEVICERCMDKEYMASK) != 0 { m |= GHOSTTY_MODS_SUPER_RIGHT.rawValue }
-        return ghostty_input_mods_e(m)
+        if raw & UInt(NX_DEVICERSHIFTKEYMASK) != 0 { m.insert(.shiftRight) }
+        if raw & UInt(NX_DEVICERCTLKEYMASK) != 0 { m.insert(.ctrlRight) }
+        if raw & UInt(NX_DEVICERALTKEYMASK) != 0 { m.insert(.altRight) }
+        if raw & UInt(NX_DEVICERCMDKEYMASK) != 0 { m.insert(.superRight) }
+        return m
     }
 
-    static func flags(_ m: ghostty_input_mods_e) -> NSEvent.ModifierFlags {
+    static func flags(_ m: GhosttyMods) -> NSEvent.ModifierFlags {
         var f: NSEvent.ModifierFlags = []
-        if m.rawValue & GHOSTTY_MODS_SHIFT.rawValue != 0 { f.insert(.shift) }
-        if m.rawValue & GHOSTTY_MODS_CTRL.rawValue != 0 { f.insert(.control) }
-        if m.rawValue & GHOSTTY_MODS_ALT.rawValue != 0 { f.insert(.option) }
-        if m.rawValue & GHOSTTY_MODS_SUPER.rawValue != 0 { f.insert(.command) }
+        if m.contains(.shift) { f.insert(.shift) }
+        if m.contains(.ctrl) { f.insert(.control) }
+        if m.contains(.alt) { f.insert(.option) }
+        if m.contains(.superMod) { f.insert(.command) }
         return f
     }
 
-    static func keyEvent(_ e: NSEvent, _ action: ghostty_input_action_e,
-                         translationMods: NSEvent.ModifierFlags? = nil) -> ghostty_input_key_s {
-        var k = ghostty_input_key_s()
-        k.action = action
-        k.keycode = UInt32(e.keyCode)
-        k.text = nil
-        k.composing = false
-        k.mods = mods(e.modifierFlags)
-        // Control and command never contribute to text translation.
-        k.consumed_mods = mods((translationMods ?? e.modifierFlags).subtracting([.control, .command]))
-        k.unshifted_codepoint = 0
+    static func keyEvent(_ e: NSEvent, _ action: KeyAction,
+                         translationMods: NSEvent.ModifierFlags? = nil) -> GhosttyKeyEvent {
+        var unshifted: UInt32 = 0
         if e.type == .keyDown || e.type == .keyUp,
            let chars = e.characters(byApplyingModifiers: []), let cp = chars.unicodeScalars.first {
-            k.unshifted_codepoint = cp.value
+            unshifted = cp.value
         }
-        return k
+        return GhosttyKeyEvent(
+            action: action,
+            mods: mods(e.modifierFlags),
+            // Control and command never contribute to text translation.
+            consumedMods: mods((translationMods ?? e.modifierFlags).subtracting([.control, .command])),
+            keycode: UInt32(e.keyCode),
+            text: nil,
+            unshiftedCodepoint: unshifted,
+            composing: false
+        )
     }
 
     /// Text for a key event, leaving control-character encoding to Ghostty.
@@ -804,32 +756,32 @@ enum GhosttyInput {
         return chars
     }
 
-    static func button(_ n: Int) -> ghostty_input_mouse_button_e {
+    static func button(_ n: Int) -> MouseButton {
         switch n {
-        case 0: return GHOSTTY_MOUSE_LEFT
-        case 1: return GHOSTTY_MOUSE_RIGHT
-        case 2: return GHOSTTY_MOUSE_MIDDLE
-        case 3: return GHOSTTY_MOUSE_EIGHT
-        case 4: return GHOSTTY_MOUSE_NINE
-        case 5: return GHOSTTY_MOUSE_SIX
-        case 6: return GHOSTTY_MOUSE_SEVEN
-        case 7: return GHOSTTY_MOUSE_FOUR
-        case 8: return GHOSTTY_MOUSE_FIVE
-        case 9: return GHOSTTY_MOUSE_TEN
-        case 10: return GHOSTTY_MOUSE_ELEVEN
-        default: return GHOSTTY_MOUSE_UNKNOWN
+        case 0: return .left
+        case 1: return .right
+        case 2: return .middle
+        case 3: return .eight
+        case 4: return .nine
+        case 5: return .six
+        case 6: return .seven
+        case 7: return .four
+        case 8: return .five
+        case 9: return .ten
+        case 10: return .eleven
+        default: return .unknown
         }
     }
 
-    static func momentum(_ p: NSEvent.Phase) -> UInt8 {
+    static func momentum(_ p: NSEvent.Phase) -> ScrollMomentum {
         switch p {
-        case .began: return 1
-        case .stationary: return 2
-        case .changed: return 3
-        case .ended: return 4
-        case .cancelled: return 5
-        case .mayBegin: return 6
-        default: return 0
+        case .began: return .began
+        case .stationary: return .stationary
+        case .changed: return .changed
+        case .ended: return .ended
+        case .cancelled: return .cancelled
+        case .mayBegin: return .mayBegin
+        default: return .none
         }
     }
 
@@ -838,24 +790,4 @@ enum GhosttyInput {
               let p = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { return nil }
         return Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
     }
-}
-
-// MARK: - C string helpers
-
-func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
-    guard let s, !s.isEmpty else { return body(nil) }
-    return s.withCString { body($0) }
-}
-
-func withCStringPairs<R>(_ pairs: [(String, String)],
-                         _ body: ([(UnsafePointer<CChar>, UnsafePointer<CChar>)]) -> R) -> R {
-    var owned: [UnsafeMutablePointer<CChar>] = []
-    defer { owned.forEach { free($0) } }
-    var out: [(UnsafePointer<CChar>, UnsafePointer<CChar>)] = []
-    for (k, v) in pairs {
-        guard let ck = strdup(k), let cv = strdup(v) else { continue }
-        owned.append(ck); owned.append(cv)
-        out.append((UnsafePointer(ck), UnsafePointer(cv)))
-    }
-    return body(out)
 }

@@ -46,6 +46,9 @@ jobs:
           test -f build/Ghostdrop.app/Contents/Resources/AGENTS.md
           test -f build/Ghostdrop.app/Contents/Resources/terminfo/78/xterm-ghostty
 
+      - name: macOS callback & prompt tests
+        run: ./scripts/ci-run.sh make test
+
   linux:
     name: linux (Arch, makepkg)
     runs-on: ubuntu-24.04
