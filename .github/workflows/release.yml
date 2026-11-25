@@ -68,7 +68,7 @@ jobs:
           cat "Ghostdrop-$VERSION.dmg.sha256"
 
       - name: Upload macOS release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-macos
           path: |
@@ -97,8 +97,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git curl ca-certificates xz-utils build-essential pkg-config \
-            libegl-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
-            fontconfig xvfb libgl1-mesa-dri libgl1 binutils
+            libegl-dev libegl-mesa0 libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            fontconfig fonts-dejavu-core xvfb libgl1-mesa-dri libgl1 binutils
 
       - uses: actions/checkout@v7
         with:
@@ -183,7 +183,7 @@ jobs:
           exit 1
 
       - name: Upload Linux release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.arch }}
           path: |
@@ -201,7 +201,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
