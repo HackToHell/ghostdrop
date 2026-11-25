@@ -199,9 +199,10 @@ build() {
     git -C "$GHOSTTY" apply "$p"
   done
 
-  echo "==> building libghostty"
+  echo "==> building libghostty (cpu=${ZIG_CPU:-baseline})"
   (cd "$GHOSTTY" && "$ZIG" build \
     -Doptimize=ReleaseFast \
+    -Dcpu="${ZIG_CPU:-baseline}" \
     -Dapp-runtime=none \
     -Demit-embed-lib=true \
     -Dsentry=false \

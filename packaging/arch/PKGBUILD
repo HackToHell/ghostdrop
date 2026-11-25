@@ -8,7 +8,7 @@
 # Then start it from your window manager (see the README).
 
 pkgname=ghostdrop
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='Fast drop-down (Quake-style) terminal on libghostty, for X11 and Wayland'
 arch=('x86_64' 'aarch64')
