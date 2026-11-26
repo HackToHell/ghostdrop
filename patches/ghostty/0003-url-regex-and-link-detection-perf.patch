@@ -1,0 +1,117 @@
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 369bb2399..3367c732d 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -4489,6 +4489,17 @@ fn linkAtPin(
+ ) !?Link {
+     if (self.config.links.len == 0) return null;
+ 
++    // ghostdrop: don't format the entire soft-wrapped logical line into a
++    // StringMap unless at least one configured link is active for `mouse_mods`.
++    if (mouse_mods) |mods| {
++        for (self.config.links) |link| {
++            switch (link.highlight) {
++                .always, .hover => break,
++                .always_mods, .hover_mods => |v| if (v.equal(mods)) break,
++            }
++        } else return null;
++    }
++
+     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+     const line = screen.selectLine(.{
+         .pin = mouse_pin,
+diff --git a/src/config/url.zig b/src/config/url.zig
+index 463ea9bfc..3d8244d71 100644
+--- a/src/config/url.zig
++++ b/src/config/url.zig
+@@ -29,7 +29,7 @@ const url_schemes =
+ ;
+ 
+ const ipv6_url_pattern =
+-    \\(?:\[[:0-9a-fA-F]+(?:[:0-9a-fA-F]*)+\](?::[0-9]+)?)
++    \\(?:\[[:0-9a-fA-F]+\](?::[0-9]+)?)
+ ;
+ 
+ const scheme_url_chars =
+@@ -40,8 +40,8 @@ const path_chars =
+     \\[\w\-.~:\/?#@!$&*+;=%]
+ ;
+ 
+-const optional_bracketed_word_suffix =
+-    \\(?:[\(\[]\w*[\)\]])?
++const bracketed_word_suffix =
++    \\[\(\[]\w*[\)\]]
+ ;
+ 
+ const no_trailing_punctuation =
+@@ -71,11 +71,12 @@ const any_path_space_segments =
+ // Branch 1: URLs with explicit schemes (http, mailto, ftp, etc.).
+ const scheme_url_branch =
+     "(?:" ++ url_schemes ++ ")" ++
+-    "(?:" ++ ipv6_url_pattern ++ "|" ++ scheme_url_chars ++ "+" ++ optional_bracketed_word_suffix ++ ")+" ++
++    "(?:" ++ ipv6_url_pattern ++ scheme_url_chars ++ "*|" ++ scheme_url_chars ++ "+)" ++
++    "(?:(?:" ++ bracketed_word_suffix ++ "|" ++ ipv6_url_pattern ++ ")" ++ scheme_url_chars ++ "*)*" ++
+     no_trailing_punctuation;
+ 
+ const rooted_or_relative_path_prefix =
+-    \\(?:\.\.\/|\.\/|(?<!\w)~\/|(?:[\w][\w\-.]*\/)*(?<!\w)\$[A-Za-z_]\w*\/|\.[\w][\w\-.]*\/|(?<![\w~\/])\/(?!\/))
++    \\(?:\.\.\/|\.\/|(?<!\w)~\/|(?<![\w\-.\/])(?:[\w][\w\-.]*\/)*\$[A-Za-z_]\w*\/|(?<![\w.])\.[\w][\w\-.]*\/|(?<![\w~\/])\/(?!\/))
+ ;
+ 
+ // Branch 2: Absolute paths and dot-relative paths (/, ./, ../).
+@@ -96,11 +97,16 @@ const rooted_or_relative_path_branch =
+     ")";
+ 
+ // Branch 3: Bare relative paths such as src/config/url.zig.
++const bare_relative_path_boundary =
++    \\(?<!\$\d*)(?<![\w.])
++;
++
+ const bare_relative_path_prefix =
+-    \\(?<!\$\d*)(?<!\w)[\w][\w\-.]*\/
++    \\[\w][\w\-.]*\/
+ ;
+ 
+ const bare_relative_path_branch =
++    bare_relative_path_boundary ++
+     dotted_path_lookahead ++
+     bare_relative_path_prefix ++
+     path_chars ++ "+" ++
+@@ -506,6 +512,9 @@ test "url regex" {
+         // double-slash comments are not paths
+         "// foo bar",
+         "//foo",
++        // pathological backtracking / unclosed bracket cases
++        "http://[aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++        "https://........................................",
+     };
+     for (no_match_cases) |input| {
+         var result = re.search(input, .{});
+diff --git a/src/renderer/link.zig b/src/renderer/link.zig
+index dfc6fe671..d87de07b3 100644
+--- a/src/renderer/link.zig
++++ b/src/renderer/link.zig
+@@ -106,11 +106,21 @@ pub const Set = struct {
+ 
+             var offset: usize = 0;
+             while (offset < str.len) {
+-                var region = link.regex.search(
++                var match_param = try oni.MatchParam.init();
++                defer match_param.deinit();
++                try match_param.setRetryLimitInSearch(100_000);
++
++                var region = link.regex.searchWithParam(
+                     str[offset..],
+                     .{},
++                    &match_param,
+                 ) catch |err| switch (err) {
+-                    error.Mismatch => break,
++                    error.Mismatch,
++                    error.RetryLimitInMatchOver,
++                    error.RetryLimitInSearchOver,
++                    error.MatchStackLimitOver,
++                    error.SubexpCallLimitInSearchOver,
++                    => break,
+                     else => return err,
+                 };
+                 defer region.deinit();
